@@ -42,6 +42,15 @@ extern "C" {
     fn CGImageGetHeight(img: *mut c_void) -> usize;
 }
 
+fn get_mouse_pos() -> (f64, f64) {
+    unsafe {
+        let e = CGEventCreate(std::ptr::null());
+        let p = CGEventGetLocation(e);
+        CFRelease(e as _);
+        (p.x, p.y)
+    }
+}
+
 // --------------------------------------------------------------------------
 // Config
 // --------------------------------------------------------------------------
@@ -53,19 +62,24 @@ const PANEL_W:  usize = 640;
 const PANEL_H:  usize = 360;
 const TARGET_FPS: u64 = 30;
 
+// 500ms cursor-sprite refresh interval
+const SPRITE_REFRESH_MS: u64 = 500;
+
 // --------------------------------------------------------------------------
-// Cursor snap — real cursor image, size, hotspot from NSCursor
+// Cursor sprite — image data only, no position. Refreshed every ~500ms.
 // --------------------------------------------------------------------------
-struct CursorSnap {
-    pos_x: f64, pos_y: f64,   // screen coords, top-left origin (CGEventGetLocation)
+struct CursorSprite {
     pixels: Vec<u8>,           // BGRA premultiplied
-    img_w: usize, img_h: usize,
-    hot_x: f64, hot_y: f64,   // hotspot in pts, top-left-of-image origin
-    pts_w: f64, pts_h: f64,   // NSImage display size in points
-    ax: f64,                   // accessibility cursor scale
+    img_w:  usize,
+    img_h:  usize,
+    hot_x:  f64,               // hotspot in pts, top-left-of-image origin
+    hot_y:  f64,
+    pts_w:  f64,               // NSImage display size in points
+    pts_h:  f64,
+    ax:     f64,               // accessibility cursor scale
 }
 
-fn get_cursor_snap() -> Option<CursorSnap> {
+fn load_cursor_sprite() -> Option<CursorSprite> {
     autoreleasepool(|| unsafe {
         let cursor: *mut Object = {
             let sys: *mut Object = msg_send![class!(NSCursor), currentSystemCursor];
@@ -76,7 +90,6 @@ fn get_cursor_snap() -> Option<CursorSnap> {
         let nsimage: *mut Object = msg_send![cursor, image];
         if nsimage.is_null() { return None; }
 
-        // CGImage from NSImage (valid for autorelease pool lifetime)
         let cgimg: *mut c_void = msg_send![
             nsimage,
             CGImageForProposedRect: (std::ptr::null::<NSPoint>() as *mut NSPoint)
@@ -92,7 +105,6 @@ fn get_cursor_snap() -> Option<CursorSnap> {
         let ns_size: NSSize = msg_send![nsimage, size];
         let hot: NSPoint    = msg_send![cursor, hotSpot];
 
-        // Accessibility cursor scale from com.apple.universalaccess
         let ax: f64 = {
             let suite: *mut Object = msg_send![
                 class!(NSString),
@@ -116,7 +128,6 @@ fn get_cursor_snap() -> Option<CursorSnap> {
             }
         };
 
-        // Render CGImage → BGRA pixels
         let mut pixels = vec![0u8; img_w * img_h * 4];
         let cs  = CGColorSpaceCreateDeviceRGB();
         let ctx = CGBitmapContextCreate(
@@ -131,15 +142,8 @@ fn get_cursor_snap() -> Option<CursorSnap> {
         CGContextRelease(ctx);
         CGColorSpaceRelease(cs);
 
-        // Mouse position (top-left origin — same as CGEventGetLocation)
-        let ev  = CGEventCreate(std::ptr::null());
-        let pos = CGEventGetLocation(ev);
-        CFRelease(ev as _);
-
-        Some(CursorSnap {
-            pos_x: pos.x, pos_y: pos.y,
-            pixels,
-            img_w, img_h,
+        Some(CursorSprite {
+            pixels, img_w, img_h,
             hot_x: hot.x, hot_y: hot.y,
             pts_w: ns_size.width, pts_h: ns_size.height,
             ax,
@@ -147,59 +151,128 @@ fn get_cursor_snap() -> Option<CursorSnap> {
     })
 }
 
-// Composite cursor BGRA (premultiplied) onto a BGRA dst buffer.
-// Handles hotspot offset, accessibility scale, and panel scaling.
-fn composite_cursor(
-    dst: &mut [u8], dw: usize, dh: usize,
-    snap: &CursorSnap,
+// --------------------------------------------------------------------------
+// Cursor scaling map cache — recomputed only when dimensions change
+// --------------------------------------------------------------------------
+struct ScaleCache {
+    xmap: Vec<usize>,
+    ymap: Vec<usize>,
+    pw: usize, ph: usize,
+    cw: usize, ch: usize,
+}
+
+impl ScaleCache {
+    fn new() -> Self {
+        Self { xmap: Vec::new(), ymap: Vec::new(), pw: 0, ph: 0, cw: 0, ch: 0 }
+    }
+
+    fn update(&mut self, pw: usize, ph: usize, cw: usize, ch: usize) {
+        if pw == self.pw && ph == self.ph && cw == self.cw && ch == self.ch { return; }
+        self.xmap = (0..pw).map(|x| x * cw / pw).collect();
+        self.ymap = (0..ph).map(|y| y * ch / ph).collect();
+        self.pw = pw; self.ph = ph; self.cw = cw; self.ch = ch;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Composite cursor onto a u32 fb panel. Clips once, no per-pixel bounds check.
+// --------------------------------------------------------------------------
+fn composite_cursor_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    sprite: &CursorSprite,
+    pos_x: f64, pos_y: f64,
     region_x: f64, region_y: f64,
     region_w: f64, region_h: f64,
+    sc: &mut ScaleCache,
 ) {
-    let sx = dw as f64 / region_w;
-    let sy = dh as f64 / region_h;
-    let ax = snap.ax;
+    let sx = panel_w as f64 / region_w;
+    let sy = panel_h as f64 / region_h;
+    let ax = sprite.ax;
 
-    // Cursor tip in capture-region coords (top-left origin)
-    let tip_x = snap.pos_x - region_x;
-    let tip_y = snap.pos_y - region_y;
+    let tl_x = (pos_x - region_x - sprite.hot_x * ax) * sx;
+    let tl_y = (pos_y - region_y - sprite.hot_y * ax) * sy;
 
-    // Top-left of cursor image in region coords
-    let tl_x = tip_x - snap.hot_x * ax;
-    let tl_y = tip_y - snap.hot_y * ax;
+    let pw = ((sprite.pts_w * ax * sx).round() as usize).max(1);
+    let ph = ((sprite.pts_h * ax * sy).round() as usize).max(1);
+    let p_tl_x = tl_x.round() as i32;
+    let p_tl_y = tl_y.round() as i32;
 
-    // Cursor display size in panel pixels
-    let pw = ((snap.pts_w * ax * sx).round() as usize).max(1);
-    let ph = ((snap.pts_h * ax * sy).round() as usize).max(1);
-    let p_tl_x = (tl_x * sx).round() as i32;
-    let p_tl_y = (tl_y * sy).round() as i32;
+    // Clip to panel bounds once
+    let x0 = p_tl_x.max(0) as usize;
+    let y0 = p_tl_y.max(0) as usize;
+    let x1 = ((p_tl_x + pw as i32) as usize).min(panel_w);
+    let y1 = ((p_tl_y + ph as i32) as usize).min(panel_h);
+    if x0 >= x1 || y0 >= y1 { return; }
 
-    let cw = snap.img_w;
-    let ch = snap.img_h;
+    sc.update(pw, ph, sprite.img_w, sprite.img_h);
+    let cw = sprite.img_w;
 
-    for py in 0..ph {
-        let dy = p_tl_y + py as i32;
-        if dy < 0 || dy >= dh as i32 { continue; }
-        let cy = py * ch / ph;
-        for px in 0..pw {
-            let dx = p_tl_x + px as i32;
-            if dx < 0 || dx >= dw as i32 { continue; }
-            let cx = px * cw / pw;
+    for dy in y0..y1 {
+        let py  = (dy as i32 - p_tl_y) as usize;
+        let cy  = sc.ymap[py];
+        let row = dy * fb_w + panel_x;
+
+        for dx in x0..x1 {
+            let px = (dx as i32 - p_tl_x) as usize;
+            let cx = sc.xmap[px];
             let ci = (cy * cw + cx) * 4;
-            let di = (dy as usize * dw + dx as usize) * 4;
-            let a  = snap.pixels[ci + 3] as u32;
+            let a  = sprite.pixels[ci + 3] as u32;
             if a == 0 { continue; }
             let ia = 255 - a;
-            // Premultiplied over: out = src + dst*(1-alpha)
-            dst[di]     = (snap.pixels[ci]     as u32 + dst[di]     as u32 * ia / 255).min(255) as u8;
-            dst[di + 1] = (snap.pixels[ci + 1] as u32 + dst[di + 1] as u32 * ia / 255).min(255) as u8;
-            dst[di + 2] = (snap.pixels[ci + 2] as u32 + dst[di + 2] as u32 * ia / 255).min(255) as u8;
-            dst[di + 3] = 255;
+
+            // cursor pixels: BGRA = [ci+0, ci+1, ci+2, ci+3]
+            let src_b = sprite.pixels[ci]     as u32;
+            let src_g = sprite.pixels[ci + 1] as u32;
+            let src_r = sprite.pixels[ci + 2] as u32;
+
+            let dst = fb[row + dx];
+            let dst_r = (dst >> 16) & 0xFF;
+            let dst_g = (dst >>  8) & 0xFF;
+            let dst_b =  dst        & 0xFF;
+
+            // premultiplied over: out = src + dst*(1-alpha)
+            let out_r = (src_r + dst_r * ia / 255).min(255);
+            let out_g = (src_g + dst_g * ia / 255).min(255);
+            let out_b = (src_b + dst_b * ia / 255).min(255);
+
+            fb[row + dx] = 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 }
 
 // --------------------------------------------------------------------------
-// Perf
+// Fused RGBA-capture → u32 fb write with nearest-neighbour downsample.
+// screenshots crate returns RGBA; we write 0xFFRRGGBB directly.
+// --------------------------------------------------------------------------
+fn write_panel_rgba_to_fb(
+    rgba: &[u8], sw: usize, sh: usize,
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    dw: usize, dh: usize,
+) {
+    for dy in 0..dh {
+        let sy = dy * sh / dh;
+        let row = dy * fb_w + panel_x;
+        for dx in 0..dw {
+            let sx = dx * sw / dw;
+            let si = (sy * sw + sx) * 4;
+            fb[row + dx] = 0xFF000000
+                | ((rgba[si]     as u32) << 16)
+                | ((rgba[si + 1] as u32) <<  8)
+                |   rgba[si + 2] as u32;
+        }
+    }
+}
+
+fn fill_panel_fb(fb: &mut [u32], fb_w: usize, panel_x: usize, dw: usize, dh: usize, color: u32) {
+    for dy in 0..dh {
+        let row = dy * fb_w + panel_x;
+        fb[row..row + dw].fill(color);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Perf — O(1) avg via rolling sum
 // --------------------------------------------------------------------------
 #[derive(Clone, Default)]
 struct FrameStats {
@@ -212,6 +285,7 @@ struct FrameStats {
 
 struct PerfRing {
     buf:        VecDeque<FrameStats>,
+    sum:        FrameStats,
     cap:        usize,
     fps_frames: u32,
     fps_timer:  Instant,
@@ -220,82 +294,94 @@ struct PerfRing {
 
 impl PerfRing {
     fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::new(), cap, fps_frames: 0, fps_timer: Instant::now(), fps: 0.0 }
+        Self {
+            buf: VecDeque::with_capacity(cap),
+            sum: FrameStats::default(),
+            cap, fps_frames: 0, fps_timer: Instant::now(), fps: 0.0,
+        }
     }
+
     fn push(&mut self, s: FrameStats) {
-        if self.buf.len() >= self.cap { self.buf.pop_front(); }
+        if self.buf.len() >= self.cap {
+            let old = self.buf.pop_front().unwrap();
+            self.sum.capture_ms   -= old.capture_ms;
+            self.sum.cursor_ms    -= old.cursor_ms;
+            self.sum.composite_ms -= old.composite_ms;
+            self.sum.display_ms   -= old.display_ms;
+            self.sum.total_ms     -= old.total_ms;
+        }
+        self.sum.capture_ms   += s.capture_ms;
+        self.sum.cursor_ms    += s.cursor_ms;
+        self.sum.composite_ms += s.composite_ms;
+        self.sum.display_ms   += s.display_ms;
+        self.sum.total_ms     += s.total_ms;
         self.buf.push_back(s);
+
         self.fps_frames += 1;
         let e = self.fps_timer.elapsed().as_secs_f64();
-        if e >= 0.5 { self.fps = self.fps_frames as f64 / e; self.fps_frames = 0; self.fps_timer = Instant::now(); }
+        if e >= 0.5 {
+            self.fps = self.fps_frames as f64 / e;
+            self.fps_frames = 0;
+            self.fps_timer = Instant::now();
+        }
     }
+
     fn avg(&self) -> FrameStats {
-        if self.buf.is_empty() { return FrameStats::default(); }
         let n = self.buf.len() as f64;
-        let mut s = FrameStats::default();
-        for f in &self.buf {
-            s.capture_ms   += f.capture_ms;   s.cursor_ms    += f.cursor_ms;
-            s.composite_ms += f.composite_ms; s.display_ms   += f.display_ms;
-            s.total_ms     += f.total_ms;
-        }
-        s.capture_ms /= n; s.cursor_ms /= n; s.composite_ms /= n;
-        s.display_ms /= n; s.total_ms  /= n;
-        s
-    }
-}
-
-// --------------------------------------------------------------------------
-// Image ops — BGRA, top-left origin
-// --------------------------------------------------------------------------
-
-fn downsample_nearest(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; dw * dh * 4];
-    for dy in 0..dh {
-        let sy = dy * sh / dh;
-        for dx in 0..dw {
-            let sx = dx * sw / dw;
-            let si = (sy * sw + sx) * 4;
-            let di = (dy * dw + dx) * 4;
-            out[di..di+4].copy_from_slice(&src[si..si+4]);
+        if n == 0.0 { return FrameStats::default(); }
+        FrameStats {
+            capture_ms:   self.sum.capture_ms   / n,
+            cursor_ms:    self.sum.cursor_ms     / n,
+            composite_ms: self.sum.composite_ms  / n,
+            display_ms:   self.sum.display_ms    / n,
+            total_ms:     self.sum.total_ms      / n,
         }
     }
-    out
-}
-
-/// BGRA → minifb u32 (0xAARRGGBB)
-fn bgra_to_u32(bgra: &[u8]) -> Vec<u32> {
-    bgra.chunks_exact(4).map(|p| {
-        0xFF000000 | ((p[2] as u32) << 16) | ((p[1] as u32) << 8) | p[0] as u32
-    }).collect()
 }
 
 // --------------------------------------------------------------------------
-// Simple 6x8 bitmap font for stats overlay
+// 6x8 bitmap font — writes directly into fb with panel_x offset
 // --------------------------------------------------------------------------
 const FONT_W: usize = 6;
 const FONT_H: usize = 8;
 static FONT6X8: &[u8; 95 * 8] = include_bytes!("font6x8.bin");
 
-fn stamp_char(buf: &mut [u32], bw: usize, bh: usize, x0: usize, y0: usize, ch: char, color: u32) {
+fn stamp_char_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    x0: usize, y0: usize, ch: char, color: u32,
+) {
     let idx = (ch as usize).saturating_sub(0x20).min(94);
     for row in 0..FONT_H {
         let byte = FONT6X8[idx * FONT_H + row];
         for col in 0..FONT_W {
             if byte & (0x80 >> col) != 0 {
-                let x = x0 + col; let y = y0 + row;
-                if x < bw && y < bh { buf[y * bw + x] = color; }
+                let x = x0 + col;
+                let y = y0 + row;
+                if x < panel_w && y < panel_h {
+                    fb[y * fb_w + panel_x + x] = color;
+                }
             }
         }
     }
 }
 
-fn stamp_str(buf: &mut [u32], bw: usize, bh: usize, x0: usize, y0: usize, s: &str, color: u32) {
+fn stamp_str_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    x0: usize, y0: usize, s: &str, color: u32,
+) {
     for (i, ch) in s.chars().enumerate() {
-        stamp_char(buf, bw, bh, x0 + i * (FONT_W + 1), y0, ch, color);
+        stamp_char_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                      x0 + i * (FONT_W + 1), y0, ch, color);
     }
 }
 
-fn draw_stats(buf: &mut Vec<u32>, bw: usize, bh: usize, s: &FrameStats, fps: f64) {
+fn draw_stats_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    s: &FrameStats, fps: f64,
+) {
     let lines = [
         format!("FPS       {:5.1}", fps),
         format!("total     {:5.2}ms", s.total_ms),
@@ -304,13 +390,21 @@ fn draw_stats(buf: &mut Vec<u32>, bw: usize, bh: usize, s: &FrameStats, fps: f64
         format!("composite {:5.2}ms", s.composite_ms),
         format!("display   {:5.2}ms", s.display_ms),
     ];
-    let box_w = 160usize; let box_h = lines.len() * (FONT_H + 2) + 6;
-    let x0 = 6usize; let y0 = 6usize;
-    for y in y0..y0+box_h { for x in x0..x0+box_w {
-        if y < bh && x < bw { buf[y * bw + x] = 0xBB000000; }
-    }}
+    let box_w = 160usize;
+    let box_h = lines.len() * (FONT_H + 2) + 6;
+    let x0 = 6usize;
+    let y0 = 6usize;
+    for y in y0..y0 + box_h {
+        let row = y * fb_w + panel_x;
+        for x in x0..x0 + box_w {
+            if y < panel_h && x < panel_w {
+                fb[row + x] = 0xBB000000;
+            }
+        }
+    }
     for (i, line) in lines.iter().enumerate() {
-        stamp_str(buf, bw, bh, x0 + 4, y0 + 4 + i * (FONT_H + 2), line, 0xFFFFFF00);
+        stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                     x0 + 4, y0 + 4 + i * (FONT_H + 2), line, 0xFFFFFF00);
     }
 }
 
@@ -330,69 +424,64 @@ fn main() {
     ).expect("window");
     win.limit_update_rate(Some(Duration::from_micros(1_000_000 / TARGET_FPS)));
 
-    let mut perf = PerfRing::new(60);
-    let mut last_print = Instant::now();
-    let mut fb = vec![0u32; total_w * PANEL_H];
+    // Single allocations — reused every frame
+    let mut fb          = vec![0u32; total_w * PANEL_H];
+    let mut perf        = PerfRing::new(60);
+    let mut sc          = ScaleCache::new();
+    let mut sprite: Option<CursorSprite> = None;
+    let mut last_sprite = Instant::now() - Duration::from_millis(SPRITE_REFRESH_MS + 1);
+    let mut last_print  = Instant::now();
 
     println!("Running. ESC to quit. Stats printed every second.");
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let t0 = Instant::now();
 
-        // ── Capture ──────────────────────────────────────────────────────
+        // ── Capture (screenshots returns RGBA; we use it directly) ────────
         let t = Instant::now();
         let img = screen.capture_area(
             REGION_X as i32, REGION_Y as i32, REGION_W, REGION_H
         ).expect("capture");
-        let raw_bgra: Vec<u8> = img.as_raw().chunks_exact(4).flat_map(|p| {
-            [p[2], p[1], p[0], p[3]] // RGBA → BGRA
-        }).collect();
+        let rgba = img.as_raw();
         let capture_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Cursor snap (real cursor image + hotspot + ax scale) ─────────
+        // ── Cursor: refresh sprite every 500ms, poll position every frame ─
         let t = Instant::now();
-        let snap = get_cursor_snap();
+        if last_sprite.elapsed() >= Duration::from_millis(SPRITE_REFRESH_MS) {
+            sprite = load_cursor_sprite();
+            last_sprite = Instant::now();
+        }
+        let (mx, my) = get_mouse_pos();
         let cursor_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Build panels ─────────────────────────────────────────────────
+        // ── Build panels directly into fb — no intermediate allocations ───
         let t = Instant::now();
 
-        // Panel 1: raw (no cursor)
-        let raw_panel = downsample_nearest(&raw_bgra, REGION_W as usize, REGION_H as usize, PANEL_W, PANEL_H);
+        // Panel 1: raw RGBA → u32 (fused, no BGRA intermediate)
+        write_panel_rgba_to_fb(rgba, REGION_W as usize, REGION_H as usize,
+                                &mut fb, total_w, 0, PANEL_W, PANEL_H);
 
         // Panel 2: cursor on dark background
-        let mut cur_panel = vec![13u8; PANEL_W * PANEL_H * 4]; // dark grey
-        for i in (3..cur_panel.len()).step_by(4) { cur_panel[i] = 255; }
+        fill_panel_fb(&mut fb, total_w, PANEL_W, PANEL_W, PANEL_H, 0xFF0D0D0D);
 
         // Panel 3: composite
-        let mut comp_panel = downsample_nearest(&raw_bgra, REGION_W as usize, REGION_H as usize, PANEL_W, PANEL_H);
+        write_panel_rgba_to_fb(rgba, REGION_W as usize, REGION_H as usize,
+                                &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H);
 
-        if let Some(ref s) = snap {
-            composite_cursor(&mut cur_panel,  PANEL_W, PANEL_H, s,
-                             REGION_X as f64, REGION_Y as f64,
-                             REGION_W as f64, REGION_H as f64);
-            composite_cursor(&mut comp_panel, PANEL_W, PANEL_H, s,
-                             REGION_X as f64, REGION_Y as f64,
-                             REGION_W as f64, REGION_H as f64);
+        if let Some(ref s) = sprite {
+            composite_cursor_fb(&mut fb, total_w, PANEL_W, PANEL_W, PANEL_H, s, mx, my,
+                                 REGION_X as f64, REGION_Y as f64,
+                                 REGION_W as f64, REGION_H as f64, &mut sc);
+            composite_cursor_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, s, mx, my,
+                                 REGION_X as f64, REGION_Y as f64,
+                                 REGION_W as f64, REGION_H as f64, &mut sc);
         }
         let composite_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Display ───────────────────────────────────────────────────────
+        // ── Display — stats overlay written directly into fb ──────────────
         let t = Instant::now();
-        let raw_u32  = bgra_to_u32(&raw_panel);
-        let cur_u32  = bgra_to_u32(&cur_panel);
-        let mut comp_u32 = bgra_to_u32(&comp_panel);
-
         let avg = perf.avg();
-        draw_stats(&mut comp_u32, PANEL_W, PANEL_H, &avg, perf.fps);
-
-        for y in 0..PANEL_H {
-            let d = y * total_w;
-            let s = y * PANEL_W;
-            fb[d..d+PANEL_W].copy_from_slice(&raw_u32[s..s+PANEL_W]);
-            fb[d+PANEL_W..d+PANEL_W*2].copy_from_slice(&cur_u32[s..s+PANEL_W]);
-            fb[d+PANEL_W*2..d+PANEL_W*3].copy_from_slice(&comp_u32[s..s+PANEL_W]);
-        }
+        draw_stats_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, &avg, perf.fps);
         win.update_with_buffer(&fb, total_w, PANEL_H).unwrap();
         let display_ms = t.elapsed().as_secs_f64() * 1000.0;
 
