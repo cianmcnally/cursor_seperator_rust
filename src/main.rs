@@ -62,8 +62,6 @@ const PANEL_W:  usize = 640;
 const PANEL_H:  usize = 360;
 const TARGET_FPS: u64 = 30;
 
-// 500ms cursor-sprite refresh interval
-const SPRITE_REFRESH_MS: u64 = 500;
 
 // --------------------------------------------------------------------------
 // Cursor sprite — image data only, no position. Refreshed every ~500ms.
@@ -428,8 +426,6 @@ fn main() {
     let mut fb          = vec![0u32; total_w * PANEL_H];
     let mut perf        = PerfRing::new(60);
     let mut sc          = ScaleCache::new();
-    let mut sprite: Option<CursorSprite> = None;
-    let mut last_sprite = Instant::now() - Duration::from_millis(SPRITE_REFRESH_MS + 1);
     let mut last_print  = Instant::now();
 
     println!("Running. ESC to quit. Stats printed every second.");
@@ -445,12 +441,9 @@ fn main() {
         let rgba = img.as_raw();
         let capture_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Cursor: refresh sprite every 500ms, poll position every frame ─
+        // ── Cursor: full sprite + position every frame ───────────────────
         let t = Instant::now();
-        if last_sprite.elapsed() >= Duration::from_millis(SPRITE_REFRESH_MS) {
-            sprite = load_cursor_sprite();
-            last_sprite = Instant::now();
-        }
+        let sprite = load_cursor_sprite();
         let (mx, my) = get_mouse_pos();
         let cursor_ms = t.elapsed().as_secs_f64() * 1000.0;
 
