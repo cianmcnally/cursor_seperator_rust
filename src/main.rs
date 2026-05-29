@@ -277,7 +277,9 @@ struct FrameStats {
     capture_ms:   f64,
     cursor_ms:    f64,
     composite_ms: f64,
-    display_ms:   f64,
+    update_ms:    f64,  // update_with_buffer only
+    sleep_ms:     f64,  // intentional frame-pace sleep
+    work_ms:      f64,  // total minus sleep
     total_ms:     f64,
 }
 
@@ -305,13 +307,17 @@ impl PerfRing {
             self.sum.capture_ms   -= old.capture_ms;
             self.sum.cursor_ms    -= old.cursor_ms;
             self.sum.composite_ms -= old.composite_ms;
-            self.sum.display_ms   -= old.display_ms;
+            self.sum.update_ms    -= old.update_ms;
+            self.sum.sleep_ms     -= old.sleep_ms;
+            self.sum.work_ms      -= old.work_ms;
             self.sum.total_ms     -= old.total_ms;
         }
         self.sum.capture_ms   += s.capture_ms;
         self.sum.cursor_ms    += s.cursor_ms;
         self.sum.composite_ms += s.composite_ms;
-        self.sum.display_ms   += s.display_ms;
+        self.sum.update_ms    += s.update_ms;
+        self.sum.sleep_ms     += s.sleep_ms;
+        self.sum.work_ms      += s.work_ms;
         self.sum.total_ms     += s.total_ms;
         self.buf.push_back(s);
 
@@ -331,7 +337,9 @@ impl PerfRing {
             capture_ms:   self.sum.capture_ms   / n,
             cursor_ms:    self.sum.cursor_ms     / n,
             composite_ms: self.sum.composite_ms  / n,
-            display_ms:   self.sum.display_ms    / n,
+            update_ms:    self.sum.update_ms     / n,
+            sleep_ms:     self.sum.sleep_ms      / n,
+            work_ms:      self.sum.work_ms       / n,
             total_ms:     self.sum.total_ms      / n,
         }
     }
@@ -383,10 +391,12 @@ fn draw_stats_fb(
     let lines = [
         format!("FPS       {:5.1}", fps),
         format!("total     {:5.2}ms", s.total_ms),
+        format!("work      {:5.2}ms", s.work_ms),
+        format!("sleep     {:5.2}ms", s.sleep_ms),
         format!("capture   {:5.2}ms", s.capture_ms),
         format!("cursor    {:5.2}ms", s.cursor_ms),
         format!("composite {:5.2}ms", s.composite_ms),
-        format!("display   {:5.2}ms", s.display_ms),
+        format!("update    {:5.2}ms", s.update_ms),
     ];
     let box_w = 160usize;
     let box_h = lines.len() * (FONT_H + 2) + 6;
@@ -420,7 +430,7 @@ fn main() {
         total_w, PANEL_H,
         WindowOptions { resize: false, ..Default::default() },
     ).expect("window");
-    win.limit_update_rate(Some(Duration::from_micros(1_000_000 / TARGET_FPS)));
+    win.limit_update_rate(None); // manual pacing — don't hide sleep inside update_with_buffer
 
     // Single allocations — reused every frame
     let mut fb          = vec![0u32; total_w * PANEL_H];
@@ -471,21 +481,36 @@ fn main() {
         }
         let composite_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Display — stats overlay written directly into fb ──────────────
-        let t = Instant::now();
+        // ── Display: stats overlay + update_with_buffer (timed separately) ─
         let avg = perf.avg();
         draw_stats_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, &avg, perf.fps);
+
+        let t = Instant::now();
         win.update_with_buffer(&fb, total_w, PANEL_H).unwrap();
-        let display_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let update_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let work_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // ── Manual frame pace — sleep only what's left of the budget ─────
+        let frame_budget = Duration::from_micros(1_000_000 / TARGET_FPS);
+        let elapsed      = t0.elapsed();
+        if elapsed < frame_budget {
+            std::thread::sleep(frame_budget - elapsed);
+        }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        perf.push(FrameStats { capture_ms, cursor_ms, composite_ms, display_ms, total_ms });
+        let sleep_ms = total_ms - work_ms;
+
+        perf.push(FrameStats {
+            capture_ms, cursor_ms, composite_ms,
+            update_ms, sleep_ms, work_ms, total_ms,
+        });
 
         if last_print.elapsed() >= Duration::from_secs(1) {
             let a = perf.avg();
             println!(
-                "fps {:5.1}  total {:5.1}ms  capture {:5.1}ms  cursor {:4.2}ms  composite {:4.2}ms  display {:5.1}ms",
-                perf.fps, a.total_ms, a.capture_ms, a.cursor_ms, a.composite_ms, a.display_ms
+                "fps {:5.1}  total {:5.1}ms  work {:5.1}ms  sleep {:5.1}ms  capture {:5.1}ms  cursor {:4.2}ms  composite {:4.2}ms  update {:4.2}ms",
+                perf.fps, a.total_ms, a.work_ms, a.sleep_ms, a.capture_ms, a.cursor_ms, a.composite_ms, a.update_ms
             );
             last_print = Instant::now();
         }
