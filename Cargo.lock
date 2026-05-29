@@ -487,6 +487,8 @@ dependencies = [
  "block",
  "minifb",
  "objc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

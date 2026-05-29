@@ -3,10 +3,24 @@
 /// Stats printed to terminal every second.
 ///
 ///   source ~/.cargo/env && cargo run --release
+///
+/// Window-layer flags (milestone 1):
+///   --window-layers          enable window sampler thread
+///   --show-window-overlay    draw window rects on panels 1 and 3
+///   --show-window-stack      print window list every second
+///   --composite-window-mask  replace panel 3 with composite label mask
+///   --include-self           include this process's windows
+///   --show-system-ui         include Dock / MenuBar windows
+///   --normal-windows-only    only layer-0 windows
+///   --dump-window-list       print window list once and exit
+///   --dump-screens           print screen geometry and exit
+///   --debug-coords           print coord calibration each second
 mod scstream;
+mod windows;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use minifb::{Key, Window, WindowOptions};
@@ -281,6 +295,238 @@ fn fill_panel_fb(fb: &mut [u32], fb_w: usize, panel_x: usize, dw: usize, dh: usi
 }
 
 // --------------------------------------------------------------------------
+// Window-layer overlay helpers
+// --------------------------------------------------------------------------
+
+/// Draw a 1-pixel-thick rectangle outline into the framebuffer.
+fn draw_rect_outline_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    rx: i32, ry: i32, rw: i32, rh: i32,
+    color: u32,
+) {
+    if rw <= 0 || rh <= 0 { return; }
+    let x0 = rx.max(0) as usize;
+    let y0 = ry.max(0) as usize;
+    let x1 = ((rx + rw - 1) as usize).min(panel_w.saturating_sub(1));
+    let y1 = ((ry + rh - 1) as usize).min(panel_h.saturating_sub(1));
+    if x0 > x1 || y0 > y1 { return; }
+
+    // Top and bottom edges
+    for x in x0..=x1 {
+        fb[y0 * fb_w + panel_x + x] = color;
+        fb[y1 * fb_w + panel_x + x] = color;
+    }
+    // Left and right edges
+    for y in y0..=y1 {
+        fb[y * fb_w + panel_x + x0] = color;
+        fb[y * fb_w + panel_x + x1] = color;
+    }
+}
+
+/// Deterministic colour per window_id — mirrors compositor::label_color.
+fn window_id_color(id: u32) -> u32 {
+    let mut h = id.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 16; h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13; h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    let r = 0x80 | ((h       ) & 0x7F);
+    let g = 0x80 | ((h >>  8) & 0x7F);
+    let b = 0x80 | ((h >> 16) & 0x7F);
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
+/// Draw window rectangles + labels onto a panel, scaling from capture pixels.
+fn draw_window_overlay_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    windows: &[windows::WindowLayer],
+    cap_w: usize, cap_h: usize,
+) {
+    for win in windows.iter().rev() { // back-to-front so front rects draw on top
+        let pr = windows::DesktopGeometry::pixel_rect_to_panel(
+            win.bounds_pixels, cap_w, cap_h, panel_w, panel_h,
+        );
+        let color = window_id_color(win.window_id);
+        draw_rect_outline_fb(
+            fb, fb_w, panel_x, panel_w, panel_h,
+            pr.x, pr.y, pr.w, pr.h, color,
+        );
+        // Label: z_index and owner_name
+        let label = format!("z{} {}", win.z_index, &win.owner_name);
+        let lx = (pr.x.max(0) as usize + 2).min(panel_w.saturating_sub(1));
+        let ly = (pr.y.max(0) as usize + 2).min(panel_h.saturating_sub(1));
+        stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h, lx, ly, &label, color);
+    }
+}
+
+/// Blit a u32 label-mask (same size as canvas) into a panel, downscaling.
+/// Render one window's visible-only cutout into a bottom-row panel.
+///
+/// The panel is zoomed to the window's own bounds.  Any pixel inside those
+/// bounds that is also covered by a higher-priority window (lower z_index =
+/// in front) is painted dark so only the actually-exposed portion shows.
+fn write_window_cutout_panel(
+    frame: &scstream::FrameData,
+    all_windows: &[windows::WindowLayer],
+    target: &windows::WindowLayer,
+    fb: &mut [u32],
+    fb_w: usize,
+    panel_x: usize,
+    panel_y: usize,  // row-start offset in the fb (e.g. PANEL_H for second row)
+    panel_w: usize,
+    panel_h: usize,
+) {
+    let cap_w = frame.width;
+    let cap_h = frame.height;
+    let bpr   = frame.bytes_per_row;
+    let tx = target.bounds_pixels.x;
+    let ty = target.bounds_pixels.y;
+    let tw = target.bounds_pixels.w;
+    let th = target.bounds_pixels.h;
+
+    // Occluders: every window that sits in front of this one (z_index < target.z_index)
+    // and is visually present.
+    let occluders: Vec<_> = all_windows
+        .iter()
+        .filter(|w| w.z_index < target.z_index && w.is_onscreen && w.alpha > 0.01
+                    && w.bounds_pixels.w > 0 && w.bounds_pixels.h > 0)
+        .collect();
+
+    for dy in 0..panel_h {
+        let row = (panel_y + dy) * fb_w + panel_x;
+
+        if tw <= 0 || th <= 0 || cap_w == 0 || cap_h == 0 {
+            fb[row..row + panel_w].fill(0xFF111111);
+            continue;
+        }
+
+        for dx in 0..panel_w {
+            // Map panel pixel → capture pixel in the window's own coordinate space.
+            let cx = (tx + dx as i32 * tw / panel_w as i32).max(0) as usize;
+            let cy = (ty + dy as i32 * th / panel_h as i32).max(0) as usize;
+
+            if cx >= cap_w || cy >= cap_h {
+                fb[row + dx] = 0xFF111111;
+                continue;
+            }
+
+            // If any front window covers this capture pixel, mask it out.
+            let cxi = cx as i32;
+            let cyi = cy as i32;
+            let occluded = occluders.iter().any(|w| {
+                let ox = w.bounds_pixels.x;
+                let oy = w.bounds_pixels.y;
+                cxi >= ox && cxi < ox + w.bounds_pixels.w
+                    && cyi >= oy && cyi < oy + w.bounds_pixels.h
+            });
+
+            if occluded {
+                fb[row + dx] = 0xFF111111;
+                continue;
+            }
+
+            let si = cy * bpr + cx * 4;
+            fb[row + dx] = if si + 3 < frame.pixels.len() {
+                0xFF000000
+                    | ((frame.pixels[si + 2] as u32) << 16)
+                    | ((frame.pixels[si + 1] as u32) << 8)
+                    | frame.pixels[si] as u32
+            } else {
+                0xFF111111
+            };
+        }
+    }
+
+    // Label: z_index + owner name in top-left of the panel.
+    let label = format!("z{} {}", target.z_index, &target.owner_name);
+    stamp_str_panel_fb(fb, fb_w, panel_x, panel_y, panel_w, panel_h, 3, 3, &label, 0xFFFFFFFF);
+}
+
+/// Like stamp_str_fb but writes to a panel that starts at row `panel_y` in the fb.
+fn stamp_str_panel_fb(
+    fb: &mut [u32], fb_w: usize,
+    panel_x: usize, panel_y: usize,
+    panel_w: usize, panel_h: usize,
+    x0: usize, y0: usize, s: &str, color: u32,
+) {
+    for (i, ch) in s.chars().enumerate() {
+        let idx = (ch as usize).saturating_sub(0x20).min(94);
+        let cx = x0 + i * (FONT_W + 1);
+        for row in 0..FONT_H {
+            let byte = FONT6X8[idx * FONT_H + row];
+            for col in 0..FONT_W {
+                if byte & (0x80 >> col) != 0 {
+                    let x = cx + col;
+                    let y = y0 + row;
+                    if x < panel_w && y < panel_h {
+                        fb[(panel_y + y) * fb_w + panel_x + x] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn blit_label_mask_to_panel(
+    label_mask: &[u32],
+    cap_w: usize, cap_h: usize,
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+) {
+    if cap_w == 0 || cap_h == 0 { return; }
+    for dy in 0..panel_h {
+        let sy = dy * cap_h / panel_h;
+        let fb_row = dy * fb_w + panel_x;
+        for dx in 0..panel_w {
+            let sx = dx * cap_w / panel_w;
+            let id = label_mask[sy * cap_w + sx];
+            fb[fb_row + dx] = windows::compositor::label_mask_to_fb(
+                std::slice::from_ref(&id), 0xFFFF_FFFF,
+            )[0];
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// CLI args
+// --------------------------------------------------------------------------
+struct WindowArgs {
+    enabled:          bool,
+    show_overlay:     bool,
+    show_stack:       bool,
+    composite_mask:   bool,
+    include_self:     bool,
+    show_system_ui:   bool,
+    normal_only:      bool,
+    dump_list:        bool,
+    dump_screens:     bool,
+    debug_coords:     bool,
+}
+
+impl WindowArgs {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        let dump_list  = has("--dump-window-list");
+        let dump_scr   = has("--dump-screens");
+        let enabled    = has("--window-layers") || dump_list || dump_scr;
+        Self {
+            enabled,
+            show_overlay:   has("--show-window-overlay"),
+            show_stack:     has("--show-window-stack"),
+            composite_mask: has("--composite-window-mask"),
+            include_self:   has("--include-self"),
+            show_system_ui: has("--show-system-ui"),
+            normal_only:    has("--normal-windows-only"),
+            dump_list,
+            dump_screens:   dump_scr,
+            debug_coords:   has("--debug-coords"),
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // Perf — O(1) avg via rolling sum
 // --------------------------------------------------------------------------
 #[derive(Clone, Default)]
@@ -436,6 +682,8 @@ fn draw_stats_fb(
 // Main
 // --------------------------------------------------------------------------
 fn main() {
+    let wargs = WindowArgs::parse();
+
     println!("Starting ScreenCaptureKit stream (requires Screen Recording permission)…");
 
     let source = if USE_REGION {
@@ -451,10 +699,69 @@ fn main() {
     let cap_w        = info.width  as f64;
     let cap_h        = info.height as f64;
 
+    // ── Window sampler thread ────────────────────────────────────────────────
+    // Shared state: latest window list (front-to-back) + timing snapshot.
+    let shared_windows: Arc<RwLock<Vec<windows::WindowLayer>>> =
+        Arc::new(RwLock::new(Vec::new()));
+    let shared_timings: Arc<RwLock<windows::WindowTimings>> =
+        Arc::new(RwLock::new(windows::WindowTimings::default()));
+
+    // Window sampler always runs — cutout panels need it regardless of flags.
+    {
+        let sw = shared_windows.clone();
+        let st = shared_timings.clone();
+        let cap_w_px  = info.width  as u32;
+        let cap_h_px  = info.height as u32;
+        let origin_x  = info.origin_x as f64;
+        let origin_y  = info.origin_y as f64;
+        let inc_self  = wargs.include_self;
+        let sys_ui    = wargs.show_system_ui;
+        let norm_only = wargs.normal_only;
+
+        std::thread::spawn(move || {
+            let desktop = windows::DesktopGeometry::from_capture(
+                cap_w_px, cap_h_px, origin_x, origin_y,
+            );
+            let mut sampler = windows::WindowSampler::new(inc_self, sys_ui, norm_only);
+            loop {
+                let t0 = Instant::now();
+                let layers = sampler.sample(&desktop);
+                let sample_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let seg_count = layers.iter().filter(|w| w.include_in_segmentation).count();
+                let raw_count = layers.len();
+                if let Ok(mut g) = sw.write() { *g = layers; }
+                if let Ok(mut g) = st.write() {
+                    g.window_sample_ms          = sample_ms;
+                    g.raw_window_count          = raw_count;
+                    g.segmentation_window_count = seg_count;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+
+    // --dump-window-list: sample once, print, exit.
+    if wargs.dump_list {
+        std::thread::sleep(Duration::from_millis(300));
+        if let Ok(g) = shared_windows.read() {
+            windows::dump_window_list(&g);
+        }
+        return;
+    }
+
+    // --dump-screens: print screen geometry, exit.
+    if wargs.dump_screens {
+        let (sw, sh) = scstream::main_display_pixels();
+        println!("Main display: {}×{} px  capture: {}×{} px  origin: ({},{})",
+            sw, sh, info.width, info.height, info.origin_x, info.origin_y);
+        return;
+    }
+
     let total_w = PANEL_W * 3;
+    let total_h = PANEL_H * 2; // row 2 holds per-window cutout panels
     let mut win = Window::new(
         "Cursor Bench  |  Rust  (SCK)",
-        total_w, PANEL_H,
+        total_w, total_h,
         WindowOptions { resize: false, ..Default::default() },
     ).expect("window");
     win.limit_update_rate(None);
@@ -470,7 +777,7 @@ fn main() {
         captured_at:   std::time::Instant::now(),
     };
 
-    let mut fb         = vec![0u32; total_w * PANEL_H];
+    let mut fb         = vec![0u32; total_w * total_h];
     let mut perf       = PerfRing::new(60);
     let mut sc         = ScaleCache::new();
     let mut last_print = Instant::now();
@@ -510,14 +817,42 @@ fn main() {
         // ── Build panels: downsample capture → PANEL_W×PANEL_H preview ───
         let t = Instant::now();
 
+        // ── Read latest window list (non-blocking) ────────────────────────
+        let win_snapshot: Vec<windows::WindowLayer> =
+            shared_windows.read().map(|g| g.clone()).unwrap_or_default();
+
         // Panel 1: raw preview (nearest-neighbour downsample)
         write_panel_bgra_scaled_to_fb(&local_frame, &mut fb, total_w, 0, PANEL_W, PANEL_H);
 
         // Panel 2: cursor-only on dark background
         fill_panel_fb(&mut fb, total_w, PANEL_W, PANEL_W, PANEL_H, 0xFF0D0D0D);
 
-        // Panel 3: composite preview background
-        write_panel_bgra_scaled_to_fb(&local_frame, &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H);
+        // Panel 3: composite preview background (or label mask)
+        if wargs.composite_mask && !win_snapshot.is_empty() {
+            let label_mask = windows::composite_label_mask(
+                &win_snapshot,
+                local_frame.width, local_frame.height,
+                None, 0,
+            );
+            blit_label_mask_to_panel(
+                &label_mask, local_frame.width, local_frame.height,
+                &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H,
+            );
+        } else {
+            write_panel_bgra_scaled_to_fb(&local_frame, &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H);
+        }
+
+        // Window rect overlay on panel 1 and panel 3
+        if wargs.show_overlay && !win_snapshot.is_empty() {
+            draw_window_overlay_fb(
+                &mut fb, total_w, 0, PANEL_W, PANEL_H,
+                &win_snapshot, local_frame.width, local_frame.height,
+            );
+            draw_window_overlay_fb(
+                &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H,
+                &win_snapshot, local_frame.width, local_frame.height,
+            );
+        }
 
         // Cursor overlay — map from real capture coords to panel pixels
         if let Some(ref s) = sprite {
@@ -528,12 +863,50 @@ fn main() {
         }
         let composite_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+        // ── Row 2: per-window visible cutouts (panels 4, 5, 6) ───────────
+        {
+            // Take the first 3 app windows front-to-back.
+            // include_in_segmentation already excludes Dock, StatusBar, tiny widgets, etc.
+            let seg_wins: Vec<_> = win_snapshot
+                .iter()
+                .filter(|w| w.include_in_segmentation)
+                .take(3)
+                .collect();
+
+            for (slot, target) in seg_wins.iter().enumerate() {
+                write_window_cutout_panel(
+                    &local_frame,
+                    &win_snapshot,
+                    target,
+                    &mut fb,
+                    total_w,
+                    slot * PANEL_W, // panel_x: 0, PANEL_W, PANEL_W*2
+                    PANEL_H,        // panel_y: start of second row
+                    PANEL_W,
+                    PANEL_H,
+                );
+            }
+
+            // Fill any unused bottom slots dark.
+            for slot in seg_wins.len()..3 {
+                let px = slot * PANEL_W;
+                for dy in 0..PANEL_H {
+                    let row = (PANEL_H + dy) * total_w + px;
+                    fb[row..row + PANEL_W].fill(0xFF111111);
+                }
+                stamp_str_panel_fb(
+                    &mut fb, total_w, px, PANEL_H, PANEL_W, PANEL_H,
+                    3, 3, "no window", 0xFF555555,
+                );
+            }
+        }
+
         // ── Display: stats overlay + update_with_buffer ───────────────────
         let avg = perf.avg();
         draw_stats_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, &avg, perf.fps);
 
         let t = Instant::now();
-        win.update_with_buffer(&fb, total_w, PANEL_H).unwrap();
+        win.update_with_buffer(&fb, total_w, total_h).unwrap();
         let update_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         let work_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -559,6 +932,26 @@ fn main() {
                 "fps {:5.1}  total {:5.1}ms  work {:5.1}ms  sleep {:5.1}ms  age {:5.1}ms  capture {:4.2}ms  cursor {:4.2}ms  composite {:4.2}ms  update {:4.2}ms",
                 perf.fps, a.total_ms, a.work_ms, a.sleep_ms, a.frame_age_ms, a.capture_ms, a.cursor_ms, a.composite_ms, a.update_ms
             );
+
+            if wargs.enabled {
+                if let Ok(wt) = shared_timings.read() {
+                    println!(
+                        "  windows: sample {:.2}ms  raw={} seg={}",
+                        wt.window_sample_ms, wt.raw_window_count, wt.segmentation_window_count
+                    );
+                }
+                if wargs.show_stack {
+                    if let Ok(g) = shared_windows.read() {
+                        windows::dump_window_list(&g);
+                    }
+                }
+                if wargs.debug_coords {
+                    if let Ok(g) = shared_windows.read() {
+                        windows::dump_coords(&g, 5);
+                    }
+                }
+            }
+
             last_print = Instant::now();
         }
     }
