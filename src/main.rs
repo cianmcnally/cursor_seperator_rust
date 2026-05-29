@@ -3,6 +3,8 @@
 /// Stats printed to terminal every second.
 ///
 ///   source ~/.cargo/env && cargo run --release
+mod scstream;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -11,7 +13,6 @@ use minifb::{Key, Window, WindowOptions};
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
-use screenshots::Screen;
 
 // --------------------------------------------------------------------------
 // CoreGraphics / CoreFoundation FFI
@@ -54,6 +55,10 @@ fn get_mouse_pos() -> (f64, f64) {
 // --------------------------------------------------------------------------
 // Config
 // --------------------------------------------------------------------------
+/// true  → capture REGION_W x REGION_H pixels from (REGION_X, REGION_Y)
+/// false → capture full display at native pixel resolution
+const USE_REGION: bool = false;
+
 const REGION_X: u32 = 0;
 const REGION_Y: u32 = 0;
 const REGION_W: u32 = 1280;
@@ -240,24 +245,30 @@ fn composite_cursor_fb(
 }
 
 // --------------------------------------------------------------------------
-// Fused RGBA-capture → u32 fb write with nearest-neighbour downsample.
-// screenshots crate returns RGBA; we write 0xFFRRGGBB directly.
+// Nearest-neighbour downsample from captured BGRA frame → u32 panel.
+// Handles stride (bytes_per_row ≥ width*4) and arbitrary scale ratios.
+// BGRA byte order: [si]=B [si+1]=G [si+2]=R [si+3]=A
 // --------------------------------------------------------------------------
-fn write_panel_rgba_to_fb(
-    rgba: &[u8], sw: usize, sh: usize,
+fn write_panel_bgra_scaled_to_fb(
+    frame: &scstream::FrameData,
     fb: &mut [u32], fb_w: usize, panel_x: usize,
-    dw: usize, dh: usize,
+    panel_w: usize, panel_h: usize,
 ) {
-    for dy in 0..dh {
-        let sy = dy * sh / dh;
-        let row = dy * fb_w + panel_x;
-        for dx in 0..dw {
-            let sx = dx * sw / dw;
-            let si = (sy * sw + sx) * 4;
-            fb[row + dx] = 0xFF000000
-                | ((rgba[si]     as u32) << 16)
-                | ((rgba[si + 1] as u32) <<  8)
-                |   rgba[si + 2] as u32;
+    let src_w = frame.width;
+    let src_h = frame.height;
+    let bpr   = frame.bytes_per_row;
+    if src_w == 0 || src_h == 0 { return; }
+    for dy in 0..panel_h {
+        let sy      = dy * src_h / panel_h;
+        let fb_row  = dy * fb_w + panel_x;
+        let src_row = sy * bpr;
+        for dx in 0..panel_w {
+            let sx = dx * src_w / panel_w;
+            let si = src_row + sx * 4;
+            fb[fb_row + dx] = 0xFF000000
+                | ((frame.pixels[si + 2] as u32) << 16)
+                | ((frame.pixels[si + 1] as u32) <<  8)
+                |   frame.pixels[si]     as u32;
         }
     }
 }
@@ -281,6 +292,7 @@ struct FrameStats {
     sleep_ms:     f64,  // intentional frame-pace sleep
     work_ms:      f64,  // total minus sleep
     total_ms:     f64,
+    frame_age_ms: f64,  // age of latest SCK frame at display time
 }
 
 struct PerfRing {
@@ -311,6 +323,7 @@ impl PerfRing {
             self.sum.sleep_ms     -= old.sleep_ms;
             self.sum.work_ms      -= old.work_ms;
             self.sum.total_ms     -= old.total_ms;
+            self.sum.frame_age_ms -= old.frame_age_ms;
         }
         self.sum.capture_ms   += s.capture_ms;
         self.sum.cursor_ms    += s.cursor_ms;
@@ -319,6 +332,7 @@ impl PerfRing {
         self.sum.sleep_ms     += s.sleep_ms;
         self.sum.work_ms      += s.work_ms;
         self.sum.total_ms     += s.total_ms;
+        self.sum.frame_age_ms += s.frame_age_ms;
         self.buf.push_back(s);
 
         self.fps_frames += 1;
@@ -341,6 +355,7 @@ impl PerfRing {
             sleep_ms:     self.sum.sleep_ms      / n,
             work_ms:      self.sum.work_ms       / n,
             total_ms:     self.sum.total_ms      / n,
+            frame_age_ms: self.sum.frame_age_ms  / n,
         }
     }
 }
@@ -393,6 +408,7 @@ fn draw_stats_fb(
         format!("total     {:5.2}ms", s.total_ms),
         format!("work      {:5.2}ms", s.work_ms),
         format!("sleep     {:5.2}ms", s.sleep_ms),
+        format!("frame age {:5.2}ms", s.frame_age_ms),
         format!("capture   {:5.2}ms", s.capture_ms),
         format!("cursor    {:5.2}ms", s.cursor_ms),
         format!("composite {:5.2}ms", s.composite_ms),
@@ -420,36 +436,70 @@ fn draw_stats_fb(
 // Main
 // --------------------------------------------------------------------------
 fn main() {
-    let screens = Screen::all().expect("no screens");
-    let screen  = screens.iter().find(|s| s.display_info.x == 0 && s.display_info.y == 0)
-                         .unwrap_or(&screens[0]);
+    println!("Starting ScreenCaptureKit stream (requires Screen Recording permission)…");
+
+    let source = if USE_REGION {
+        scstream::CaptureSource::Region { x: REGION_X, y: REGION_Y, w: REGION_W, h: REGION_H }
+    } else {
+        scstream::CaptureSource::FullDisplay
+    };
+    let info = scstream::start_capture(source, TARGET_FPS as u32);
+
+    // Cursor compositing uses the real captured region's geometry
+    let cap_origin_x = info.origin_x as f64;
+    let cap_origin_y = info.origin_y as f64;
+    let cap_w        = info.width  as f64;
+    let cap_h        = info.height as f64;
 
     let total_w = PANEL_W * 3;
     let mut win = Window::new(
-        "Cursor Bench  |  Rust",
+        "Cursor Bench  |  Rust  (SCK)",
         total_w, PANEL_H,
         WindowOptions { resize: false, ..Default::default() },
     ).expect("window");
-    win.limit_update_rate(None); // manual pacing — don't hide sleep inside update_with_buffer
+    win.limit_update_rate(None);
 
-    // Single allocations — reused every frame
-    let mut fb          = vec![0u32; total_w * PANEL_H];
-    let mut perf        = PerfRing::new(60);
-    let mut sc          = ScaleCache::new();
-    let mut last_print  = Instant::now();
+    // Local copy of the latest SCK frame — sized for the capture resolution.
+    // Avoids holding the SCK mutex during the (possibly slow) preview blit.
+    let mut local_frame = scstream::FrameData {
+        pixels:        vec![0u8; info.width * info.height * 4],
+        width:         info.width,
+        height:        info.height,
+        bytes_per_row: info.width * 4,
+        seq:           0,
+        captured_at:   std::time::Instant::now(),
+    };
+
+    let mut fb         = vec![0u32; total_w * PANEL_H];
+    let mut perf       = PerfRing::new(60);
+    let mut sc         = ScaleCache::new();
+    let mut last_print = Instant::now();
 
     println!("Running. ESC to quit. Stats printed every second.");
+    println!("Capture: {}×{} pixels  Preview panels: {}×{}", info.width, info.height, PANEL_W, PANEL_H);
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let t0 = Instant::now();
 
-        // ── Capture (screenshots returns RGBA; we use it directly) ────────
+        // ── Capture: lock SharedFrame, memcpy pixels, release lock ────────
+        // capture_ms = mutex contention + memcpy; SCK callback runs on bg_queue.
         let t = Instant::now();
-        let img = screen.capture_area(
-            REGION_X as i32, REGION_Y as i32, REGION_W, REGION_H
-        ).expect("capture");
-        let rgba = img.as_raw();
-        let capture_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(guard) = info.frame.try_lock() {
+            if let Some(ref f) = *guard {
+                // Grow local buffer if stride differs from expected
+                if local_frame.pixels.len() < f.pixels.len() {
+                    local_frame.pixels.resize(f.pixels.len(), 0);
+                }
+                local_frame.pixels[..f.pixels.len()].copy_from_slice(&f.pixels);
+                local_frame.width        = f.width;
+                local_frame.height       = f.height;
+                local_frame.bytes_per_row = f.bytes_per_row;
+                local_frame.seq          = f.seq;
+                local_frame.captured_at   = f.captured_at;
+            }
+        }
+        let capture_ms   = t.elapsed().as_secs_f64() * 1000.0;
+        let frame_age_ms = local_frame.captured_at.elapsed().as_secs_f64() * 1000.0;
 
         // ── Cursor: full sprite + position every frame ───────────────────
         let t = Instant::now();
@@ -457,31 +507,28 @@ fn main() {
         let (mx, my) = get_mouse_pos();
         let cursor_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Build panels directly into fb — no intermediate allocations ───
+        // ── Build panels: downsample capture → PANEL_W×PANEL_H preview ───
         let t = Instant::now();
 
-        // Panel 1: raw RGBA → u32 (fused, no BGRA intermediate)
-        write_panel_rgba_to_fb(rgba, REGION_W as usize, REGION_H as usize,
-                                &mut fb, total_w, 0, PANEL_W, PANEL_H);
+        // Panel 1: raw preview (nearest-neighbour downsample)
+        write_panel_bgra_scaled_to_fb(&local_frame, &mut fb, total_w, 0, PANEL_W, PANEL_H);
 
-        // Panel 2: cursor on dark background
+        // Panel 2: cursor-only on dark background
         fill_panel_fb(&mut fb, total_w, PANEL_W, PANEL_W, PANEL_H, 0xFF0D0D0D);
 
-        // Panel 3: composite
-        write_panel_rgba_to_fb(rgba, REGION_W as usize, REGION_H as usize,
-                                &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H);
+        // Panel 3: composite preview background
+        write_panel_bgra_scaled_to_fb(&local_frame, &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H);
 
+        // Cursor overlay — map from real capture coords to panel pixels
         if let Some(ref s) = sprite {
             composite_cursor_fb(&mut fb, total_w, PANEL_W, PANEL_W, PANEL_H, s, mx, my,
-                                 REGION_X as f64, REGION_Y as f64,
-                                 REGION_W as f64, REGION_H as f64, &mut sc);
+                                 cap_origin_x, cap_origin_y, cap_w, cap_h, &mut sc);
             composite_cursor_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, s, mx, my,
-                                 REGION_X as f64, REGION_Y as f64,
-                                 REGION_W as f64, REGION_H as f64, &mut sc);
+                                 cap_origin_x, cap_origin_y, cap_w, cap_h, &mut sc);
         }
         let composite_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Display: stats overlay + update_with_buffer (timed separately) ─
+        // ── Display: stats overlay + update_with_buffer ───────────────────
         let avg = perf.avg();
         draw_stats_fb(&mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H, &avg, perf.fps);
 
@@ -491,7 +538,7 @@ fn main() {
 
         let work_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Manual frame pace — sleep only what's left of the budget ─────
+        // ── Manual frame pace ─────────────────────────────────────────────
         let frame_budget = Duration::from_micros(1_000_000 / TARGET_FPS);
         let elapsed      = t0.elapsed();
         if elapsed < frame_budget {
@@ -503,14 +550,14 @@ fn main() {
 
         perf.push(FrameStats {
             capture_ms, cursor_ms, composite_ms,
-            update_ms, sleep_ms, work_ms, total_ms,
+            update_ms, sleep_ms, work_ms, total_ms, frame_age_ms,
         });
 
         if last_print.elapsed() >= Duration::from_secs(1) {
             let a = perf.avg();
             println!(
-                "fps {:5.1}  total {:5.1}ms  work {:5.1}ms  sleep {:5.1}ms  capture {:5.1}ms  cursor {:4.2}ms  composite {:4.2}ms  update {:4.2}ms",
-                perf.fps, a.total_ms, a.work_ms, a.sleep_ms, a.capture_ms, a.cursor_ms, a.composite_ms, a.update_ms
+                "fps {:5.1}  total {:5.1}ms  work {:5.1}ms  sleep {:5.1}ms  age {:5.1}ms  capture {:4.2}ms  cursor {:4.2}ms  composite {:4.2}ms  update {:4.2}ms",
+                perf.fps, a.total_ms, a.work_ms, a.sleep_ms, a.frame_age_ms, a.capture_ms, a.cursor_ms, a.composite_ms, a.update_ms
             );
             last_print = Instant::now();
         }

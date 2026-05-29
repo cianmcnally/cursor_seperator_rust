@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-screenshots = "0.8"
-minifb      = "0.27"
-objc        = "0.2"
+minifb = "0.27"
+objc   = "0.2"
+block  = "0.1"
 
 [profile.release]
 opt-level = 3
