@@ -4,7 +4,7 @@
 ///
 ///   source ~/.cargo/env && cargo run --release
 ///
-/// Window-layer flags (milestone 1):
+/// Window-layer flags:
 ///   --window-layers          enable window sampler thread
 ///   --show-window-overlay    draw window rects on panels 1 and 3
 ///   --show-window-stack      print window list every second
@@ -15,7 +15,21 @@
 ///   --dump-window-list       print window list once and exit
 ///   --dump-screens           print screen geometry and exit
 ///   --debug-coords           print coord calibration each second
+///
+/// Typing-area detection flags:
+///   --show-typing-debug      overlay confidence + source text
+///   --show-typing-roi        overlay the ROI rectangle searched
+///   --show-typing-diff       overlay diff pixels inside ROI
+///   --typing-only            show only panel 1 (raw) with typing overlay
+///
+/// Cursor-action detection flags:
+///   --show-cursor-actions    overlay action labels on panels 1 and 3
+///   --show-drag-path         overlay drag path trail on panels 1 and 3
+///   --show-click-markers     overlay click/double-click circles on panels 1 and 3
+///   --export-cursor-actions  emit cursor action JSON to stdout
+mod cursor_action;
 mod scstream;
+mod typing;
 mod windows;
 
 use std::collections::VecDeque;
@@ -64,6 +78,33 @@ fn get_mouse_pos() -> (f64, f64) {
         CFRelease(e as _);
         (p.x, p.y)
     }
+}
+
+/// Backing scale factor from NSScreen.mainScreen (2.0 on Retina).
+fn get_backing_scale() -> f64 {
+    autoreleasepool(|| unsafe {
+        let screen: *mut Object = msg_send![class!(NSScreen), mainScreen];
+        if screen.is_null() { return 2.0; }
+        let scale: f64 = msg_send![screen, backingScaleFactor];
+        if scale <= 0.0 { 2.0 } else { scale }
+    })
+}
+
+/// Cursor bounding box in capture-pixel coordinates.
+/// `cap_origin_*` are the capture region origin in pixels (0 for full-display).
+fn cursor_rect_px(
+    mx: f64, my: f64,
+    sprite: &CursorSprite,
+    cap_origin_x: f64,
+    cap_origin_y: f64,
+    scale: f64,
+) -> windows::model::RectI {
+    let ax = sprite.ax;
+    let x  = ((mx * scale - cap_origin_x) - sprite.hot_x * ax * scale).round() as i32;
+    let y  = ((my * scale - cap_origin_y) - sprite.hot_y * ax * scale).round() as i32;
+    let w  = (sprite.pts_w * ax * scale).round().max(1.0) as i32;
+    let h  = (sprite.pts_h * ax * scale).round().max(1.0) as i32;
+    windows::model::RectI { x, y, w, h }
 }
 
 // --------------------------------------------------------------------------
@@ -360,12 +401,11 @@ fn draw_window_overlay_fb(
     }
 }
 
-/// Blit a u32 label-mask (same size as canvas) into a panel, downscaling.
 /// Render one window's visible-only cutout into a bottom-row panel.
 ///
-/// The panel is zoomed to the window's own bounds.  Any pixel inside those
-/// bounds that is also covered by a higher-priority window (lower z_index =
-/// in front) is painted dark so only the actually-exposed portion shows.
+/// Uses the same full-frame downscale as panel 1 — the window sits at its real
+/// screen position.  Pixels outside the window's bounds, or covered by a
+/// higher-priority app window, are painted dark.
 fn write_window_cutout_panel(
     frame: &scstream::FrameData,
     all_windows: &[windows::WindowLayer],
@@ -373,54 +413,56 @@ fn write_window_cutout_panel(
     fb: &mut [u32],
     fb_w: usize,
     panel_x: usize,
-    panel_y: usize,  // row-start offset in the fb (e.g. PANEL_H for second row)
+    panel_y: usize,
     panel_w: usize,
     panel_h: usize,
 ) {
     let cap_w = frame.width;
     let cap_h = frame.height;
     let bpr   = frame.bytes_per_row;
+
+    if cap_w == 0 || cap_h == 0 {
+        for dy in 0..panel_h {
+            let row = (panel_y + dy) * fb_w + panel_x;
+            fb[row..row + panel_w].fill(0xFF111111);
+        }
+        return;
+    }
+
     let tx = target.bounds_pixels.x;
     let ty = target.bounds_pixels.y;
     let tw = target.bounds_pixels.w;
     let th = target.bounds_pixels.h;
 
-    // Occluders: every window that sits in front of this one (z_index < target.z_index)
-    // and is visually present.
+    // Occluders: only include_in_segmentation windows — system windows like Dock
+    // report full-screen bounds and would incorrectly black out everything.
     let occluders: Vec<_> = all_windows
         .iter()
-        .filter(|w| w.z_index < target.z_index && w.is_onscreen && w.alpha > 0.01
-                    && w.bounds_pixels.w > 0 && w.bounds_pixels.h > 0)
+        .filter(|w| w.z_index < target.z_index && w.include_in_segmentation)
         .collect();
 
     for dy in 0..panel_h {
         let row = (panel_y + dy) * fb_w + panel_x;
-
-        if tw <= 0 || th <= 0 || cap_w == 0 || cap_h == 0 {
-            fb[row..row + panel_w].fill(0xFF111111);
-            continue;
-        }
-
         for dx in 0..panel_w {
-            // Map panel pixel → capture pixel in the window's own coordinate space.
-            let cx = (tx + dx as i32 * tw / panel_w as i32).max(0) as usize;
-            let cy = (ty + dy as i32 * th / panel_h as i32).max(0) as usize;
+            // Same full-frame downscale as panel 1.
+            let cx = dx * cap_w / panel_w;
+            let cy = dy * cap_h / panel_h;
+            let cxi = cx as i32;
+            let cyi = cy as i32;
 
-            if cx >= cap_w || cy >= cap_h {
+            // Outside this window → dark.
+            if cxi < tx || cxi >= tx + tw || cyi < ty || cyi >= ty + th {
                 fb[row + dx] = 0xFF111111;
                 continue;
             }
 
-            // If any front window covers this capture pixel, mask it out.
-            let cxi = cx as i32;
-            let cyi = cy as i32;
+            // Covered by a front app window → dark.
             let occluded = occluders.iter().any(|w| {
-                let ox = w.bounds_pixels.x;
-                let oy = w.bounds_pixels.y;
-                cxi >= ox && cxi < ox + w.bounds_pixels.w
-                    && cyi >= oy && cyi < oy + w.bounds_pixels.h
+                cxi >= w.bounds_pixels.x
+                    && cxi < w.bounds_pixels.x + w.bounds_pixels.w
+                    && cyi >= w.bounds_pixels.y
+                    && cyi < w.bounds_pixels.y + w.bounds_pixels.h
             });
-
             if occluded {
                 fb[row + dx] = 0xFF111111;
                 continue;
@@ -481,9 +523,7 @@ fn blit_label_mask_to_panel(
         for dx in 0..panel_w {
             let sx = dx * cap_w / panel_w;
             let id = label_mask[sy * cap_w + sx];
-            fb[fb_row + dx] = windows::compositor::label_mask_to_fb(
-                std::slice::from_ref(&id), 0xFFFF_FFFF,
-            )[0];
+            fb[fb_row + dx] = windows::compositor::label_to_fb_pixel(id, 0xFFFF_FFFF);
         }
     }
 }
@@ -523,6 +563,52 @@ impl WindowArgs {
             dump_screens:   dump_scr,
             debug_coords:   has("--debug-coords"),
         }
+    }
+}
+
+struct TypingFlags {
+    show_debug:  bool,
+    show_roi:    bool,
+    show_diff:   bool,
+    typing_only: bool,
+}
+
+impl TypingFlags {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        Self {
+            show_debug:  has("--show-typing-debug"),
+            show_roi:    has("--show-typing-roi"),
+            show_diff:   has("--show-typing-diff"),
+            typing_only: has("--typing-only"),
+        }
+    }
+    fn any_active(&self) -> bool {
+        self.show_debug || self.show_roi || self.show_diff || self.typing_only
+    }
+}
+
+struct CursorFlags {
+    show_actions:     bool,
+    show_drag_path:   bool,
+    show_click_marks: bool,
+    export_actions:   bool,
+}
+
+impl CursorFlags {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        Self {
+            show_actions:     has("--show-cursor-actions"),
+            show_drag_path:   has("--show-drag-path"),
+            show_click_marks: has("--show-click-markers"),
+            export_actions:   has("--export-cursor-actions"),
+        }
+    }
+    fn any_visible(&self) -> bool {
+        self.show_actions || self.show_drag_path || self.show_click_marks
     }
 }
 
@@ -679,10 +765,299 @@ fn draw_stats_fb(
 }
 
 // --------------------------------------------------------------------------
+// Typing overlay helpers
+// --------------------------------------------------------------------------
+
+/// Draw a 2-pixel-thick rectangle outline (for typing-area bbox).
+fn draw_rect2_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    rx: i32, ry: i32, rw: i32, rh: i32,
+    color: u32,
+) {
+    for t in 0..2i32 {
+        draw_rect_outline_fb(fb, fb_w, panel_x, panel_w, panel_h,
+            rx - t, ry - t, rw + t * 2, rh + t * 2, color);
+    }
+}
+
+/// Blit grayscale diff pixels as green-tinted overlay at ROI position.
+fn draw_diff_overlay_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    diff_gray: &[u8],
+    roi: windows::model::RectI,
+    cap_w: usize, cap_h: usize,
+) {
+    if cap_w == 0 || cap_h == 0 { return; }
+    let roi_w = roi.w as usize;
+    let roi_h = roi.h as usize;
+    if roi_w == 0 || roi_h == 0 { return; }
+
+    let sx = panel_w as f64 / cap_w as f64;
+    let sy = panel_h as f64 / cap_h as f64;
+
+    // Panel region covered by ROI
+    let px0 = (roi.x as f64 * sx).round() as usize;
+    let py0 = (roi.y as f64 * sy).round() as usize;
+    let px1 = ((roi.x + roi.w) as f64 * sx).round() as usize;
+    let py1 = ((roi.y + roi.h) as f64 * sy).round() as usize;
+    let pw  = (px1.saturating_sub(px0)).max(1);
+    let ph  = (py1.saturating_sub(py0)).max(1);
+
+    for dy in 0..ph {
+        let panel_row = py0 + dy;
+        if panel_row >= panel_h { break; }
+        let roi_row = dy * roi_h / ph;
+
+        for dx in 0..pw {
+            let panel_col = px0 + dx;
+            if panel_col >= panel_w { break; }
+            let roi_col = dx * roi_w / pw;
+            let v = diff_gray.get(roi_row * roi_w + roi_col).copied().unwrap_or(0);
+            if v == 0 { continue; }
+            let alpha = (v as u32).min(200);
+            let ia    = 255 - alpha;
+            let dst   = fb[panel_row * fb_w + panel_x + panel_col];
+            let dr    = (dst >> 16) & 0xFF;
+            let dg    = (dst >>  8) & 0xFF;
+            let db    =  dst        & 0xFF;
+            // Green tint: src = (0, alpha, 0)
+            let out_r = (dr * ia / 255).min(255);
+            let out_g = ((alpha + dg * ia / 255)).min(255);
+            let out_b = (db * ia / 255).min(255);
+            fb[panel_row * fb_w + panel_x + panel_col] =
+                0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
+        }
+    }
+}
+
+/// Draw typing overlay (typing area rect + optional ROI + optional diff).
+fn draw_typing_overlay(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    result: &typing::TypingDetectorResult,
+    flags:  &TypingFlags,
+    cap_w:  usize,
+    cap_h:  usize,
+) {
+    // Diff pixels first (background-ish layer)
+    if flags.show_diff {
+        if let Some((ref dpx, roi)) = result.diff_gray {
+            draw_diff_overlay_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                dpx, roi, cap_w, cap_h);
+        }
+    }
+
+    // ROI rectangle (faint dark-yellow)
+    if flags.show_roi {
+        if let Some(roi) = result.roi {
+            let pr = windows::DesktopGeometry::pixel_rect_to_panel(
+                roi, cap_w, cap_h, panel_w, panel_h,
+            );
+            draw_rect_outline_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                pr.x, pr.y, pr.w, pr.h, 0xFF606000);
+        }
+    }
+
+    // Detected typing area (bright green, 2px thick)
+    if let Some(ref reg) = result.region {
+        let pr = windows::DesktopGeometry::pixel_rect_to_panel(
+            reg.bbox, cap_w, cap_h, panel_w, panel_h,
+        );
+        // active = yellow (focused, no diff yet); typing = green (diff confirmed)
+        let color = if reg.source == "active" { 0xFF888800 } else { 0xFF00FF44 };
+        draw_rect2_fb(fb, fb_w, panel_x, panel_w, panel_h,
+            pr.x, pr.y, pr.w, pr.h, color);
+
+        if flags.show_debug {
+            let label = format!("{:.2} {}", reg.confidence, reg.source);
+            let lx = (pr.x.max(0) as usize).min(panel_w.saturating_sub(1));
+            let ly = (pr.y.max(0) as usize).saturating_sub(FONT_H + 2);
+            stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                lx, ly, &label, color);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Cursor-action overlay helpers
+// --------------------------------------------------------------------------
+
+/// Bresenham circle outline into the framebuffer.
+fn draw_circle_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    cx: i32, cy: i32, r: i32, color: u32,
+) {
+    let (mut x, mut y, mut err) = (r, 0i32, 0i32);
+    while x >= y {
+        for &(px, py) in &[
+            (cx + x, cy + y), (cx - x, cy + y),
+            (cx + x, cy - y), (cx - x, cy - y),
+            (cx + y, cy + x), (cx - y, cy + x),
+            (cx + y, cy - x), (cx - y, cy - x),
+        ] {
+            if px >= 0 && px < panel_w as i32 && py >= 0 && py < panel_h as i32 {
+                fb[py as usize * fb_w + panel_x + px as usize] = color;
+            }
+        }
+        y += 1;
+        if err <= 0 { err += 2 * y + 1; }
+        if err > 0  { x -= 1; err -= 2 * x + 1; }
+    }
+}
+
+/// Cross/plus marker.
+fn draw_cross_fb(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    cx: i32, cy: i32, r: i32, color: u32,
+) {
+    for i in -r..=r {
+        for &(x, y) in &[(cx + i, cy), (cx, cy + i)] {
+            if x >= 0 && x < panel_w as i32 && y >= 0 && y < panel_h as i32 {
+                fb[y as usize * fb_w + panel_x + x as usize] = color;
+            }
+        }
+    }
+}
+
+/// Draw cursor-action debug overlay onto a panel.
+fn draw_cursor_action_overlay(
+    fb: &mut [u32], fb_w: usize, panel_x: usize,
+    panel_w: usize, panel_h: usize,
+    snap: &cursor_action::ActionSnapshot,
+    flags: &CursorFlags,
+    cap_w: usize, cap_h: usize,
+) {
+    if cap_w == 0 || cap_h == 0 { return; }
+
+    let scale_x = |x: i32| -> i32 { (x as f64 * panel_w as f64 / cap_w as f64) as i32 };
+    let scale_y = |y: i32| -> i32 { (y as f64 * panel_h as f64 / cap_h as f64) as i32 };
+
+    // ── Drag path trail ───────────────────────────────────────────────────────
+    if flags.show_drag_path && !snap.drag_path.is_empty() {
+        for pt in &snap.drag_path {
+            let px = scale_x(pt.0);
+            let py = scale_y(pt.1);
+            for dy in 0..2i32 {
+                for dx in 0..2i32 {
+                    let x = px + dx;
+                    let y = py + dy;
+                    if x >= 0 && x < panel_w as i32 && y >= 0 && y < panel_h as i32 {
+                        fb[y as usize * fb_w + panel_x + x as usize] = 0xFF00AAFF;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Drag bbox ─────────────────────────────────────────────────────────────
+    if flags.show_drag_path {
+        if let Some([bx, by, bw, bh]) = snap.drag_bbox {
+            let pr = windows::DesktopGeometry::pixel_rect_to_panel(
+                windows::model::RectI { x: bx, y: by, w: bw, h: bh },
+                cap_w, cap_h, panel_w, panel_h,
+            );
+            draw_rect_outline_fb(
+                fb, fb_w, panel_x, panel_w, panel_h,
+                pr.x, pr.y, pr.w, pr.h, 0xFF0088DD,
+            );
+        }
+    }
+
+    // ── Mouse-down anchor point ───────────────────────────────────────────────
+    if flags.show_click_marks {
+        if snap.is_mouse_down {
+            if let Some(dp) = snap.mouse_down_pos {
+                let color = if snap.is_dragging { 0xFFFF4400 } else { 0xFFFFAA00 };
+                draw_cross_fb(
+                    fb, fb_w, panel_x, panel_w, panel_h,
+                    scale_x(dp.0), scale_y(dp.1), 5, color,
+                );
+            }
+        }
+    }
+
+    // ── Recent action markers ─────────────────────────────────────────────────
+    if flags.show_click_marks || flags.show_actions {
+        for action in snap.recent_actions.iter().rev().take(8) {
+            let px = scale_x(action.position.0);
+            let py = scale_y(action.position.1);
+
+            match action.kind {
+                cursor_action::CursorActionKind::SingleClick => {
+                    draw_circle_fb(
+                        fb, fb_w, panel_x, panel_w, panel_h,
+                        px, py, 5, 0xFFFFFF00,
+                    );
+                    if flags.show_actions {
+                        let lx = (px + 8).max(0) as usize;
+                        let ly = (py - FONT_H as i32 - 2).max(0) as usize;
+                        stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h, lx, ly, "click", 0xFFFFFF00);
+                    }
+                }
+                cursor_action::CursorActionKind::DoubleClick => {
+                    draw_circle_fb(fb, fb_w, panel_x, panel_w, panel_h, px, py, 5, 0xFF00FFFF);
+                    draw_circle_fb(fb, fb_w, panel_x, panel_w, panel_h, px, py, 9, 0xFF00FFFF);
+                    if flags.show_actions {
+                        let lx = (px + 10).max(0) as usize;
+                        let ly = (py - FONT_H as i32 - 2).max(0) as usize;
+                        stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h, lx, ly, "dbl", 0xFF00FFFF);
+                    }
+                }
+                cursor_action::CursorActionKind::ClickAndHold => {
+                    draw_circle_fb(fb, fb_w, panel_x, panel_w, panel_h, px, py, 7, 0xFFFF8800);
+                    if flags.show_actions {
+                        let lx = (px + 8).max(0) as usize;
+                        let ly = (py - FONT_H as i32 - 2).max(0) as usize;
+                        stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h, lx, ly, "hold", 0xFFFF8800);
+                    }
+                }
+                cursor_action::CursorActionKind::DragStart => {
+                    if flags.show_drag_path {
+                        draw_cross_fb(fb, fb_w, panel_x, panel_w, panel_h, px, py, 6, 0xFF00FF88);
+                        if flags.show_actions {
+                            stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                                (px + 7).max(0) as usize, (py - FONT_H as i32 - 2).max(0) as usize,
+                                "drag", 0xFF00FF88);
+                        }
+                    }
+                }
+                cursor_action::CursorActionKind::DragEnd => {
+                    if flags.show_drag_path {
+                        draw_cross_fb(fb, fb_w, panel_x, panel_w, panel_h, px, py, 6, 0xFF00AAFF);
+                        if flags.show_actions {
+                            stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                                (px + 7).max(0) as usize, (py - FONT_H as i32 - 2).max(0) as usize,
+                                "end", 0xFF00AAFF);
+                        }
+                    }
+                }
+                cursor_action::CursorActionKind::DragSelect => {
+                    if flags.show_actions {
+                        if let Some([bx, by, bw, _bh]) = action.bbox {
+                            let label_x = (scale_x(bx) + 2).max(0) as usize;
+                            let label_y = (scale_y(by) + 2).max(0) as usize;
+                            stamp_str_fb(fb, fb_w, panel_x, panel_w, panel_h,
+                                label_x, label_y, "sel?", 0xFF888888);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // Main
 // --------------------------------------------------------------------------
 fn main() {
-    let wargs = WindowArgs::parse();
+    let wargs  = WindowArgs::parse();
+    let tflags = TypingFlags::parse();
+    let cflags = CursorFlags::parse();
 
     println!("Starting ScreenCaptureKit stream (requires Screen Recording permission)…");
 
@@ -694,10 +1069,14 @@ fn main() {
     let info = scstream::start_capture(source, TARGET_FPS as u32);
 
     // Cursor compositing uses the real captured region's geometry
-    let cap_origin_x = info.origin_x as f64;
-    let cap_origin_y = info.origin_y as f64;
-    let cap_w        = info.width  as f64;
-    let cap_h        = info.height as f64;
+    let cap_origin_x    = info.origin_x as f64;
+    let cap_origin_y    = info.origin_y as f64;
+    let cap_w           = info.width  as f64;
+    let cap_h           = info.height as f64;
+    let backing_scale   = get_backing_scale();
+    // cap_origin in pixels for typing detector
+    let cap_origin_x_px = info.origin_x as f64;
+    let cap_origin_y_px = info.origin_y as f64;
 
     // ── Window sampler thread ────────────────────────────────────────────────
     // Shared state: latest window list (front-to-back) + timing snapshot.
@@ -740,6 +1119,37 @@ fn main() {
         });
     }
 
+    // ── Frame ring buffer + typing detector ─────────────────────────────────
+    let frame_ring = typing::FrameRingBuffer::new(10);
+    let typing_state = typing::start_typing_detector(
+        frame_ring.clone(),
+        typing::TypingArgs {
+            show_diff:    tflags.show_diff,
+            scale:        backing_scale,
+            cap_origin_x: cap_origin_x_px,
+            cap_origin_y: cap_origin_y_px,
+        },
+    );
+    if tflags.any_active() {
+        println!("Typing detector started (requires Input Monitoring permission).");
+    }
+
+    // ── Cursor-action detector ───────────────────────────────────────────────
+    let action_state = cursor_action::start_cursor_action_detector(
+        shared_windows.clone(),
+        cursor_action::CursorActionArgs {
+            scale:          backing_scale,
+            cap_origin_x:   cap_origin_x_px,
+            cap_origin_y:   cap_origin_y_px,
+            cap_width:      info.width  as u32,
+            cap_height:     info.height as u32,
+            export_actions: cflags.export_actions,
+        },
+    );
+    if cflags.any_visible() || cflags.export_actions {
+        println!("Cursor-action detector started (requires Input Monitoring permission).");
+    }
+
     // --dump-window-list: sample once, print, exit.
     if wargs.dump_list {
         std::thread::sleep(Duration::from_millis(300));
@@ -777,10 +1187,11 @@ fn main() {
         captured_at:   std::time::Instant::now(),
     };
 
-    let mut fb         = vec![0u32; total_w * total_h];
-    let mut perf       = PerfRing::new(60);
-    let mut sc         = ScaleCache::new();
-    let mut last_print = Instant::now();
+    let mut fb            = vec![0u32; total_w * total_h];
+    let mut perf          = PerfRing::new(60);
+    let mut sc            = ScaleCache::new();
+    let mut last_print    = Instant::now();
+    let mut last_ring_seq = 0u64;
 
     println!("Running. ESC to quit. Stats printed every second.");
     println!("Capture: {}×{} pixels  Preview panels: {}×{}", info.width, info.height, PANEL_W, PANEL_H);
@@ -813,6 +1224,29 @@ fn main() {
         let sprite = load_cursor_sprite();
         let (mx, my) = get_mouse_pos();
         let cursor_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // ── Push new frame to ring buffer (skip if seq unchanged) ────────
+        if local_frame.seq != last_ring_seq && local_frame.width > 0 {
+            last_ring_seq = local_frame.seq;
+            let cur_rect = sprite.as_ref().map(|s| {
+                cursor_rect_px(mx, my, s, cap_origin_x_px, cap_origin_y_px, backing_scale)
+            });
+            let win_snap = shared_windows.read().map(|g| g.clone()).unwrap_or_default();
+            frame_ring.push(typing::RingEntry {
+                captured_at:   local_frame.captured_at,
+                timestamp_ns:  std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64,
+                pixels:        local_frame.pixels[..local_frame.height * local_frame.bytes_per_row]
+                    .to_vec(),
+                width:         local_frame.width,
+                height:        local_frame.height,
+                bytes_per_row: local_frame.bytes_per_row,
+                cursor_rect:   cur_rect,
+                windows:       win_snap,
+            });
+        }
 
         // ── Build panels: downsample capture → PANEL_W×PANEL_H preview ───
         let t = Instant::now();
@@ -851,6 +1285,39 @@ fn main() {
             draw_window_overlay_fb(
                 &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H,
                 &win_snapshot, local_frame.width, local_frame.height,
+            );
+        }
+
+        // Typing overlay on panel 1
+        {
+            let tresult = typing_state.read();
+            draw_typing_overlay(
+                &mut fb, total_w, 0, PANEL_W, PANEL_H,
+                &tresult, &tflags,
+                local_frame.width, local_frame.height,
+            );
+            // Also draw on panel 3 (composite) unless typing-only
+            if !tflags.typing_only {
+                draw_typing_overlay(
+                    &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H,
+                    &tresult, &tflags,
+                    local_frame.width, local_frame.height,
+                );
+            }
+        }
+
+        // Cursor-action overlay on panels 1 and 3
+        if cflags.any_visible() {
+            let snap = action_state.snapshot();
+            draw_cursor_action_overlay(
+                &mut fb, total_w, 0, PANEL_W, PANEL_H,
+                &snap, &cflags,
+                local_frame.width, local_frame.height,
+            );
+            draw_cursor_action_overlay(
+                &mut fb, total_w, PANEL_W * 2, PANEL_W, PANEL_H,
+                &snap, &cflags,
+                local_frame.width, local_frame.height,
             );
         }
 
@@ -948,6 +1415,31 @@ fn main() {
                 if wargs.debug_coords {
                     if let Ok(g) = shared_windows.read() {
                         windows::dump_coords(&g, 5);
+                        // Mask coverage sanity check
+                        if !g.is_empty() {
+                            let lm = windows::composite_label_mask(
+                                &g,
+                                local_frame.width, local_frame.height,
+                                None, 0,
+                            );
+                            let nonzero = lm.iter().filter(|&&v| v != 0).count();
+                            eprintln!(
+                                "  mask nonzero={} / {} = {:.1}%  canvas={}x{}",
+                                nonzero, lm.len(),
+                                100.0 * nonzero as f64 / lm.len().max(1) as f64,
+                                local_frame.width, local_frame.height,
+                            );
+                            for w in g.iter().filter(|w| w.include_in_segmentation).take(5) {
+                                eprintln!(
+                                    "  z={} id={} rect=({},{} {}x{}) canvas={}x{} owner={}",
+                                    w.z_index, w.window_id,
+                                    w.bounds_pixels.x, w.bounds_pixels.y,
+                                    w.bounds_pixels.w, w.bounds_pixels.h,
+                                    local_frame.width, local_frame.height,
+                                    w.owner_name,
+                                );
+                            }
+                        }
                     }
                 }
             }
