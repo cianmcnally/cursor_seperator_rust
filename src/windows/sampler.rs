@@ -1,7 +1,32 @@
 use std::ffi::c_void;
 
 use super::coords::DesktopGeometry;
-use super::model::{RectF, WindowCategory, WindowLayer};
+use super::masks::assign_mask_roles;
+use super::model::{RectF, WindowCategory, WindowLayer, WindowMaskRole};
+
+// ── AppKit (NSWorkspace) ──────────────────────────────────────────────────────
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
+/// PID of the frontmost application via NSWorkspace.
+/// Returns None if AppKit call fails (shouldn't happen in normal use).
+pub fn get_active_pid() -> Option<i32> {
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let workspace: *mut objc::runtime::Object =
+            msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return None;
+        }
+        let front: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
+        if front.is_null() {
+            return None;
+        }
+        let pid: i32 = msg_send![front, processIdentifier];
+        Some(pid)
+    }
+}
 
 // ── CoreFoundation / CoreGraphics FFI ─────────────────────────────────────────
 
@@ -193,7 +218,27 @@ impl WindowSampler {
     /// Sample all on-screen windows and return a front-to-back vec (z_index 0 = frontmost).
     /// Also populates `self.last_layers` with the filtered segmentation list.
     pub fn sample(&mut self, desktop: &DesktopGeometry) -> Vec<WindowLayer> {
-        let windows = unsafe { self.sample_raw(desktop) };
+        let mut windows = unsafe { self.sample_raw(desktop) };
+
+        // Popup windows must have a layer-0 sibling from the same process already
+        // in segmentation. Without this, transient app-owned overlays (e.g. a
+        // screenshot tool that creates a floating panel with no main window visible)
+        // appear as large coloured squares in the mask.
+        let layer0_pids: std::collections::HashSet<i32> = windows.iter()
+            .filter(|w| w.include_in_segmentation && w.cg_layer == 0)
+            .map(|w| w.owner_pid)
+            .collect();
+        for w in &mut windows {
+            if w.include_in_segmentation && w.category.is_popup_like() {
+                if !layer0_pids.contains(&w.owner_pid) {
+                    w.include_in_segmentation = false;
+                }
+            }
+        }
+
+        let active_pid = get_active_pid();
+        assign_mask_roles(&mut windows, active_pid);
+
         self.last_layers = windows
             .iter()
             .filter(|w| w.include_in_segmentation)
@@ -251,9 +296,24 @@ impl WindowSampler {
 
             let category = WindowCategory::from_layer_and_owner(cg_layer, &owner_name);
 
-            let include = self.should_include(
-                is_onscreen, alpha, &bounds_px, cg_layer, owner_pid, &category,
+            // Exclude windows completely outside the capture area.
+            // This handles windows on other displays in a multi-monitor setup.
+            let cap_w = desktop.capture_width_px as i32;
+            let cap_h = desktop.capture_height_px as i32;
+            let outside_capture = bounds_px.x >= cap_w
+                || bounds_px.y >= cap_h
+                || bounds_px.x + bounds_px.w <= 0
+                || bounds_px.y + bounds_px.h <= 0;
+
+            // Exclude macOS screenshot and capture-tool UIs from segmentation.
+            let is_capture_tool = matches!(
+                owner_name.as_str(),
+                "screencaptureui" | "Screenshot"
             );
+
+            let include = !outside_capture
+                && !is_capture_tool
+                && self.should_include(is_onscreen, alpha, &bounds_px, cg_layer, owner_pid, &category);
 
             out.push(WindowLayer {
                 window_id,
@@ -271,6 +331,7 @@ impl WindowSampler {
                 memory_usage,
                 category,
                 include_in_segmentation: include,
+                mask_role: WindowMaskRole::default(),
             });
         }
 
@@ -306,7 +367,7 @@ impl WindowSampler {
             _ => {}
         }
 
-        if self.normal_windows_only && cg_layer != 0 {
+        if self.normal_windows_only && cg_layer != 0 && !category.is_popup_like() {
             return false;
         }
 
@@ -321,27 +382,14 @@ pub fn dump_window_list(windows: &[WindowLayer]) {
         let seg = if w.include_in_segmentation { "SEG" } else { "   " };
         let name = w.window_name.as_deref().unwrap_or("");
         println!(
-            "  z={:<3} id={:<6} lyr={:<4} pid={:<6} α={:.2} {}×{}@({},{}) [{:?}] {} {}  {}",
+            "  z={:<3} id={:<6} lyr={:<4} pid={:<6} α={:.2} {}×{}@({},{}) [{:?}] {} [{:?}] {}  {}",
             w.z_index, w.window_id, w.cg_layer, w.owner_pid, w.alpha,
             w.bounds_pixels.w, w.bounds_pixels.h,
             w.bounds_pixels.x, w.bounds_pixels.y,
             w.category,
-            seg, w.owner_name, name,
+            seg, w.mask_role, w.owner_name, name,
         );
     }
 }
 
-/// Print a calibration table: first N windows showing points vs pixels.
-pub fn dump_coords(windows: &[WindowLayer], n: usize) {
-    println!("── Coord calibration (first {} windows) ──────────────────", n);
-    for w in windows.iter().take(n) {
-        println!(
-            "  {} pts({:.0},{:.0} {}×{}) → px({},{} {}×{})",
-            w.owner_name,
-            w.bounds_points.x, w.bounds_points.y,
-            w.bounds_points.w, w.bounds_points.h,
-            w.bounds_pixels.x, w.bounds_pixels.y,
-            w.bounds_pixels.w, w.bounds_pixels.h,
-        );
-    }
-}
+

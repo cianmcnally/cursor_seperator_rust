@@ -3,17 +3,6 @@ use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 
-// Local CGRect for NSScreen calls — same layout as in main.rs / scstream.rs.
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGPoint { x: f64, y: f64 }
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGSize { width: f64, height: f64 }
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGRect { origin: CGPoint, size: CGSize }
-
 /// Maps between CoreGraphics window-server coordinate space and capture-pixel space.
 ///
 /// CGWindowListCopyWindowInfo returns bounds in **points**, top-left origin of the
@@ -71,23 +60,6 @@ impl DesktopGeometry {
         };
 
         RectI { x: px_x, y: px_y, w: px_w, h: px_h }
-    }
-
-    /// Scale a pixel rect from capture space to a smaller display panel.
-    /// cap_w / cap_h are the full capture dimensions; panel_w / panel_h are the panel.
-    pub fn pixel_rect_to_panel(
-        rect: RectI,
-        cap_w: usize,
-        cap_h: usize,
-        panel_w: usize,
-        panel_h: usize,
-    ) -> RectI {
-        if cap_w == 0 || cap_h == 0 { return RectI::default(); }
-        let x = rect.x as i64 * panel_w as i64 / cap_w as i64;
-        let y = rect.y as i64 * panel_h as i64 / cap_h as i64;
-        let w = rect.w as i64 * panel_w as i64 / cap_w as i64;
-        let h = rect.h as i64 * panel_h as i64 / cap_h as i64;
-        RectI { x: x as i32, y: y as i32, w: w.max(1) as i32, h: h.max(1) as i32 }
     }
 }
 

@@ -20,9 +20,6 @@ impl RectI {
     pub fn area(&self) -> i64 {
         (self.w.max(0) as i64) * (self.h.max(0) as i64)
     }
-    pub fn is_empty(&self) -> bool {
-        self.w <= 0 || self.h <= 0
-    }
     /// Clip to [0, canvas_w) × [0, canvas_h).  Returns None if fully outside.
     pub fn clip(&self, canvas_w: i32, canvas_h: i32) -> Option<RectI> {
         let x0 = self.x.max(0);
@@ -40,6 +37,9 @@ impl RectI {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WindowCategory {
     NormalAppWindow,
+    /// App-owned transient window: dropdown, context menu, popover, modal panel.
+    /// Gets its parent window's label in the segmentation mask.
+    Popup,
     SystemUi,
     MenuBar,
     Dock,
@@ -52,22 +52,49 @@ pub enum WindowCategory {
 
 impl WindowCategory {
     pub fn from_layer_and_owner(cg_layer: i32, owner: &str) -> Self {
+        let is_system = owner.contains("Window Server") || owner.contains("Dock");
         match cg_layer {
             i32::MIN..=-1 => WindowCategory::Desktop,
-            0 => WindowCategory::NormalAppWindow,
-            1..=19 => WindowCategory::TooltipPopover,
-            20 if owner == "Dock" => WindowCategory::Dock,
-            20..=30 => {
-                if owner.contains("Window Server") || owner.contains("Dock") {
-                    WindowCategory::SystemUi
-                } else {
-                    WindowCategory::Overlay
-                }
+            0             => WindowCategory::NormalAppWindow,
+            // Layers 1-19: tooltip/popover level — system-owned are system UI,
+            // app-owned are treated as popups.
+            1..=19 => {
+                if is_system { WindowCategory::SystemUi } else { WindowCategory::TooltipPopover }
             }
-            31..=499 => WindowCategory::Overlay,
+            20 if owner == "Dock" => WindowCategory::Dock,
+            // Layers 20-499: NSPopUpMenuWindowLevel (101), modal panels (8), floating (3)
+            // etc. App-owned → Popup; system-owned → SystemUi.
+            20..=499 => {
+                if is_system { WindowCategory::SystemUi } else { WindowCategory::Popup }
+            }
             _ => WindowCategory::SystemUi,
         }
     }
+
+    pub fn is_popup_like(&self) -> bool {
+        matches!(self, WindowCategory::Popup | WindowCategory::TooltipPopover)
+    }
+}
+
+/// Semantic role of a window in the segmentation mask.
+///
+/// z_index / include_in_segmentation handle compositing; this handles *meaning*.
+/// The frontmost popup is allowed to win the z-mask but must not claim focus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum WindowMaskRole {
+    /// Active app's primary normal window (keyboard focus owner).
+    FocusedRoot,
+    /// Another app's primary normal window (visible but not focused).
+    UnfocusedRoot,
+    /// Transient owned by the focused app (dropdown, context menu, popover).
+    PopupOfFocused,
+    /// Transient owned by a non-focused app.
+    PopupOfUnfocused,
+    /// System / other window that occludes but has no training label.
+    Occluder,
+    /// Not in segmentation or fully invisible — skip entirely.
+    #[default]
+    Ignore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,15 +116,17 @@ pub struct WindowLayer {
     pub memory_usage: Option<i64>,
     pub category: WindowCategory,
     pub include_in_segmentation: bool,
+    /// Semantic role assigned after focus detection. Set by assign_mask_roles().
+    pub mask_role: WindowMaskRole,
 }
 
 /// Timing snapshot from one sample + composite cycle.
 #[derive(Debug, Clone, Default)]
 pub struct WindowTimings {
     pub window_sample_ms: f64,
-    pub mask_build_ms: f64,
-    pub composite_ms: f64,
-    pub render_ms: f64,
+    pub _mask_build_ms: f64,
+    pub _composite_ms: f64,
+    pub _render_ms: f64,
     pub raw_window_count: usize,
     pub segmentation_window_count: usize,
 }

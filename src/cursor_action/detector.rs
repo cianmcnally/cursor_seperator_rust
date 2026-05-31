@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -8,18 +8,23 @@ use super::model::{CursorAction, CursorActionKind};
 use super::tap::{MouseTapEvent, start_mouse_tap};
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
+//
+// 7-class model: idle / move / click / double_click / drag / scroll / typing.
+// A press→release that never travels past DRAG_START_DIST is a `click`, regardless
+// of how long it was held (held + jittery presses fold into `click`). A press that
+// travels past it becomes a `drag`. No duration gate ⇒ no [250ms,400ms) dead-zone,
+// and double-click works after any-length first press.
 
-const DOUBLE_CLICK_MAX_NS:   u64 = 500_000_000;   // 500ms
+const DOUBLE_CLICK_MAX_NS:   u64 = 500_000_000;   // 500ms between clicks
 const DOUBLE_CLICK_MAX_DIST: f64 = 8.0;           // px
-const DRAG_START_DIST:       f64 = 6.0;           // px
-const CLICK_MAX_NS:          u64 = 250_000_000;   // 250ms
-const CLICK_MAX_MOVEMENT:    f64 = 6.0;           // px
-const HOLD_MIN_NS:           u64 = 400_000_000;   // 400ms
-const DRAG_SAMPLE_MIN_DIST:  f64 = 2.0;           // px
-const DRAG_SAMPLE_MIN_NS:    u64 = 8_000_000;     // 8ms
-const MOVE_SAMPLE_MIN_DIST:  f64 = 4.0;           // px
-const MOVE_SAMPLE_MIN_NS:    u64 = 16_000_000;    // 16ms
-const RECENT_CAP:            usize = 64;
+const DRAG_START_DIST:       f64 = 6.0;           // px travel that turns a press into a drag
+const DRAG_SAMPLE_MIN_DIST:  f64 = 2.0;           // px between sampled drag-path points
+const DRAG_SAMPLE_MIN_NS:    u64 = 8_000_000;     // 8ms between sampled drag-path points
+const MOVE_SAMPLE_MIN_DIST:  f64 = 4.0;           // px before a move refreshes activity
+const MOVE_SAMPLE_MIN_NS:    u64 = 16_000_000;    // 16ms before a move refreshes activity
+/// How long a momentary action (click/double/scroll/move/drag) keeps labelling the
+/// per-frame `current` class before it decays back to `idle`.
+const ACTIVE_TTL_NS:         u64 = 200_000_000;   // 200ms
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -30,45 +35,62 @@ pub struct CursorActionArgs {
     pub cap_width:      u32,
     pub cap_height:     u32,
     pub export_actions: bool,
+    /// If set, every discrete action (click/double/drag/scroll) is also sent here.
+    pub event_tx:       Option<std::sync::mpsc::Sender<super::model::CursorAction>>,
 }
 
-/// Snapshot readable from the render thread.
-#[derive(Clone, Default)]
+/// Snapshot readable from the capture thread. All-Copy so per-frame reads are cheap
+/// (no Vec/VecDeque clones).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct ActionSnapshot {
-    pub recent_actions: VecDeque<CursorAction>,
-    pub drag_path:      Vec<(i32, i32)>,
-    pub drag_bbox:      Option<[i32; 4]>,
-    pub is_dragging:    bool,
-    pub is_mouse_down:  bool,
-    pub mouse_down_pos: Option<(i32, i32)>,
+    /// The live per-frame label — always exactly one of the seven classes.
+    pub current:       CursorActionKind,
+    pub is_dragging:   bool,
+    pub is_mouse_down: bool,
 }
 
-pub struct SharedActionState(Mutex<ActionSnapshot>);
+pub struct SharedActionState {
+    snap:   Mutex<ActionSnapshot>,
+    /// Cumulative per-kind counts since the detector started.
+    pub session_counts: Arc<Mutex<HashMap<&'static str, u64>>>,
+}
 
 impl SharedActionState {
     fn new() -> Arc<Self> {
-        Arc::new(Self(Mutex::new(ActionSnapshot::default())))
+        Arc::new(Self {
+            snap:           Mutex::new(ActionSnapshot::default()),
+            session_counts: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub fn snapshot(&self) -> ActionSnapshot {
-        self.0.lock().unwrap().clone()
+        *self.snap.lock().unwrap()
     }
 
     fn write(&self, s: ActionSnapshot) {
-        *self.0.lock().unwrap() = s;
+        *self.snap.lock().unwrap() = s;
+    }
+
+    fn increment(&self, kind: &'static str) {
+        if let Ok(mut c) = self.session_counts.lock() {
+            *c.entry(kind).or_insert(0) += 1;
+        }
     }
 }
 
+/// Returns `(state, tap_alive)`. Poll `tap_alive` shortly after startup: if it is
+/// still false, Input Monitoring permission is denied and no mouse events will be
+/// recorded (the session would be useless).
 pub fn start_cursor_action_detector(
     windows: Arc<RwLock<Vec<WindowLayer>>>,
     args:    CursorActionArgs,
-) -> Arc<SharedActionState> {
+) -> (Arc<SharedActionState>, Arc<std::sync::atomic::AtomicBool>) {
     let state  = SharedActionState::new();
     let state2 = state.clone();
     let (tx, rx) = std::sync::mpsc::channel::<MouseTapEvent>();
-    start_mouse_tap(tx);
+    let tap_alive = start_mouse_tap(tx);
     std::thread::spawn(move || run_detector(rx, state2, windows, args));
-    state
+    (state, tap_alive)
 }
 
 // ── Internal state ────────────────────────────────────────────────────────────
@@ -82,7 +104,6 @@ struct DetState {
     is_mouse_down:        bool,
 
     is_dragging:          bool,
-    hold_emitted:         bool,
 
     drag_path:            Vec<(i32, i32)>,
     // min_x, min_y, max_x, max_y
@@ -95,7 +116,9 @@ struct DetState {
     last_click_pos:       Option<(i32, i32)>,
     last_click_ts:        Option<u64>,
 
-    recent_actions:       VecDeque<CursorAction>,
+    /// Most recent momentary signal (move/scroll/click/double/drag) + when it fired.
+    /// Drives the decaying per-frame `current` label.
+    last_activity:        Option<(CursorActionKind, u64)>,
 }
 
 impl DetState {
@@ -107,7 +130,6 @@ impl DetState {
             mouse_down_ts:        None,
             is_mouse_down:        false,
             is_dragging:          false,
-            hold_emitted:         false,
             drag_path:            Vec::new(),
             drag_bbox_mm:         None,
             last_drag_sample_pos: None,
@@ -116,15 +138,8 @@ impl DetState {
             drag_z_index:         None,
             last_click_pos:       None,
             last_click_ts:        None,
-            recent_actions:       VecDeque::with_capacity(RECENT_CAP),
+            last_activity:        None,
         }
-    }
-
-    fn push(&mut self, a: CursorAction) {
-        if self.recent_actions.len() >= RECENT_CAP {
-            self.recent_actions.pop_front();
-        }
-        self.recent_actions.push_back(a);
     }
 
     fn update_bbox(&mut self, p: (i32, i32)) {
@@ -149,14 +164,21 @@ impl DetState {
         Some([x, y, w, h])
     }
 
-    fn snapshot(&self, cap_w: u32, cap_h: u32) -> ActionSnapshot {
+    /// The live per-frame label. Always one of the seven classes.
+    fn current_kind(&self, now: u64) -> CursorActionKind {
+        if self.is_dragging  { return CursorActionKind::Drag; }
+        if self.is_mouse_down { return CursorActionKind::Click; }  // press in progress
+        match self.last_activity {
+            Some((k, ts)) if now.saturating_sub(ts) < ACTIVE_TTL_NS => k,
+            _ => CursorActionKind::Idle,
+        }
+    }
+
+    fn snapshot(&self, now: u64) -> ActionSnapshot {
         ActionSnapshot {
-            recent_actions: self.recent_actions.clone(),
-            drag_path:      self.drag_path.clone(),
-            drag_bbox:      if self.is_dragging { self.bbox_arr(cap_w, cap_h) } else { None },
-            is_dragging:    self.is_dragging,
-            is_mouse_down:  self.is_mouse_down,
-            mouse_down_pos: self.mouse_down_pos,
+            current:       self.current_kind(now),
+            is_dragging:   self.is_dragging,
+            is_mouse_down: self.is_mouse_down,
         }
     }
 
@@ -208,6 +230,13 @@ fn export(a: &CursorAction) {
     }
 }
 
+/// Emit a discrete action: stdout (if enabled), recorder channel, session counter.
+fn emit(a: &CursorAction, args: &CursorActionArgs, state: &SharedActionState) {
+    if args.export_actions { export(a); }
+    if let Some(ref tx) = args.event_tx { let _ = tx.send(a.clone()); }
+    state.increment(super::action_kind_str(a.kind));
+}
+
 // ── Detector loop ─────────────────────────────────────────────────────────────
 
 fn run_detector(
@@ -217,56 +246,26 @@ fn run_detector(
     args:    CursorActionArgs,
 ) {
     let mut ds = DetState::new();
+    let mut last_written = ActionSnapshot::default();
+    state.write(last_written);
 
     loop {
-        let mut changed = false;
-
         loop {
             match rx.try_recv() {
                 Ok(ev) => {
                     let wins = windows.read().map(|g| g.clone()).unwrap_or_default();
-                    process_event(&mut ds, ev, &args, &wins);
-                    changed = true;
+                    process_event(&mut ds, ev, &args, &wins, &state);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(_) => return,
             }
         }
 
-        // ClickAndHold: time-based detection in polling loop
-        if ds.is_mouse_down && !ds.is_dragging && !ds.hold_emitted {
-            if let (Some(dp), Some(dt)) = (ds.mouse_down_pos, ds.mouse_down_ts) {
-                let now = now_ns();
-                if now.saturating_sub(dt) >= HOLD_MIN_NS {
-                    let wins = windows.read().map(|g| g.clone()).unwrap_or_default();
-                    let (wid, zidx) = window_at(dp, &wins);
-                    let a = CursorAction {
-                        kind:           CursorActionKind::ClickAndHold,
-                        timestamp_ns:   now,
-                        position:       dp,
-                        start_position: Some(dp),
-                        end_position:   None,
-                        path:           Vec::new(),
-                        bbox:           None,
-                        duration_ms:    Some(now.saturating_sub(dt) as f64 / 1_000_000.0),
-                        distance_px:    Some(0.0),
-                        button:         Some("left".into()),
-                        click_count:    None,
-                        window_id:      wid,
-                        z_index:        zidx,
-                        confidence:     0.95,
-                        source:         "mouse_events".into(),
-                    };
-                    if args.export_actions { export(&a); }
-                    ds.push(a);
-                    ds.hold_emitted = true;
-                    changed = true;
-                }
-            }
-        }
-
-        if changed {
-            state.write(ds.snapshot(args.cap_width, args.cap_height));
+        // Recompute the decaying per-frame label and publish only when it changes.
+        let snap = ds.snapshot(now_ns());
+        if snap != last_written {
+            state.write(snap);
+            last_written = snap;
         }
 
         std::thread::sleep(Duration::from_millis(4));
@@ -276,10 +275,11 @@ fn run_detector(
 // ── Event processing (state machine) ─────────────────────────────────────────
 
 fn process_event(
-    ds:   &mut DetState,
-    ev:   MouseTapEvent,
-    args: &CursorActionArgs,
-    wins: &[WindowLayer],
+    ds:    &mut DetState,
+    ev:    MouseTapEvent,
+    args:  &CursorActionArgs,
+    wins:  &[WindowLayer],
+    state: &SharedActionState,
 ) {
     let scale = args.scale;
     let ox    = args.cap_origin_x;
@@ -294,9 +294,9 @@ fn process_event(
             ds.mouse_down_pos = Some(pos);
             ds.mouse_down_ts  = Some(ts_ns);
             ds.is_mouse_down  = true;
-            ds.hold_emitted   = false;
             ds.reset_drag();
             ds.last_pos = Some(pos);
+            // current → Click (press in progress) via current_kind()
         }
 
         // ── Left mouse up ─────────────────────────────────────────────────────
@@ -305,16 +305,16 @@ fn process_event(
             let (wid, zidx) = window_at(pos, wins);
 
             if ds.is_dragging {
-                on_drag_end(ds, pos, ts_ns, wid, zidx, cw, ch, args);
+                on_drag_end(ds, pos, ts_ns, wid, zidx, cw, ch, args, state);
+                ds.last_activity = Some((CursorActionKind::Drag, ts_ns));
             } else if let (Some(down_pos), Some(down_ts)) =
                 (ds.mouse_down_pos, ds.mouse_down_ts)
             {
+                // Not a drag ⇒ a click, whatever its duration.
                 let dur_ns = ts_ns.saturating_sub(down_ts);
                 let moved  = dist(down_pos, pos);
-                if dur_ns <= CLICK_MAX_NS && moved <= CLICK_MAX_MOVEMENT {
-                    on_click(ds, pos, down_pos, ts_ns, dur_ns, moved, wid, zidx, args);
-                }
-                // else: slow release without drag — hold was already emitted or missed
+                let kind   = on_click(ds, pos, down_pos, ts_ns, dur_ns, moved, wid, zidx, args, state);
+                ds.last_activity = Some((kind, ts_ns));
             }
 
             ds.is_mouse_down = false;
@@ -326,17 +326,15 @@ fn process_event(
         MouseTapEvent::LeftMouseDrag { ts_ns, x_pts, y_pts, .. } => {
             let pos = to_px(x_pts, y_pts, scale, ox, oy);
             if !ds.is_mouse_down {
-                // Spurious drag without tracked down
                 ds.last_pos = Some(pos);
                 return;
             }
             let down_pos = match ds.mouse_down_pos { Some(p) => p, None => { ds.last_pos = Some(pos); return; } };
             let down_ts  = ds.mouse_down_ts.unwrap_or(ts_ns);
 
-            let dist_from_down = dist(down_pos, pos);
-
-            if !ds.is_dragging && dist_from_down > DRAG_START_DIST {
-                // DragStart
+            if !ds.is_dragging && dist(down_pos, pos) > DRAG_START_DIST {
+                // Begin a drag. No event yet — one `Drag` is emitted on release with
+                // the full path, so events.ndjson gets one drag per gesture.
                 let (wid, zidx) = window_at(down_pos, wins);
                 ds.drag_window_id = wid;
                 ds.drag_z_index   = zidx;
@@ -346,26 +344,6 @@ fn process_event(
                 ds.update_bbox(down_pos);
                 ds.last_drag_sample_pos = Some(down_pos);
                 ds.last_drag_sample_ts  = Some(down_ts);
-
-                let a = CursorAction {
-                    kind:           CursorActionKind::DragStart,
-                    timestamp_ns:   ts_ns,
-                    position:       down_pos,
-                    start_position: Some(down_pos),
-                    end_position:   None,
-                    path:           vec![down_pos],
-                    bbox:           None,
-                    duration_ms:    None,
-                    distance_px:    None,
-                    button:         Some("left".into()),
-                    click_count:    None,
-                    window_id:      wid,
-                    z_index:        zidx,
-                    confidence:     0.95,
-                    source:         "mouse_events".into(),
-                };
-                if args.export_actions { export(&a); }
-                ds.push(a);
             }
 
             if ds.is_dragging {
@@ -376,35 +354,11 @@ fn process_event(
                     }
                     _ => true,
                 };
-
                 if should_sample {
                     ds.drag_path.push(pos);
                     ds.update_bbox(pos);
                     ds.last_drag_sample_pos = Some(pos);
                     ds.last_drag_sample_ts  = Some(ts_ns);
-
-                    if args.export_actions {
-                        let bbox = ds.bbox_arr(cw, ch);
-                        let a = CursorAction {
-                            kind:           CursorActionKind::DragMove,
-                            timestamp_ns:   ts_ns,
-                            position:       pos,
-                            start_position: Some(down_pos),
-                            end_position:   None,
-                            path:           vec![pos],   // current point only; full path in DragEnd
-                            bbox,
-                            duration_ms:    Some(ts_ns.saturating_sub(down_ts) as f64 / 1_000_000.0),
-                            distance_px:    Some(dist_from_down),
-                            button:         Some("left".into()),
-                            click_count:    None,
-                            window_id:      ds.drag_window_id,
-                            z_index:        ds.drag_z_index,
-                            confidence:     0.95,
-                            source:         "mouse_events".into(),
-                        };
-                        export(&a);
-                        // DragMove not added to recent_actions (high frequency)
-                    }
                 }
             }
 
@@ -415,17 +369,22 @@ fn process_event(
         MouseTapEvent::MouseMoved { ts_ns, x_pts, y_pts, .. } => {
             let pos = to_px(x_pts, y_pts, scale, ox, oy);
 
-            if args.export_actions {
-                let should_sample = match (ds.last_pos, ds.last_move_ts) {
-                    (Some(lp), Some(lt)) => {
-                        dist(lp, pos) >= MOVE_SAMPLE_MIN_DIST
-                            && ts_ns.saturating_sub(lt) >= MOVE_SAMPLE_MIN_NS
-                    }
-                    _ => true,
-                };
-                if should_sample {
+            let moved_enough = match (ds.last_pos, ds.last_move_ts) {
+                (Some(lp), Some(lt)) => {
+                    dist(lp, pos) >= MOVE_SAMPLE_MIN_DIST
+                        && ts_ns.saturating_sub(lt) >= MOVE_SAMPLE_MIN_NS
+                }
+                _ => true,
+            };
+            if moved_enough {
+                // Drives the per-frame `move` label. Move is NOT pushed to the
+                // recorder event stream (high frequency, low value); the per-frame
+                // cursor.action already captures movement.
+                ds.last_activity = Some((CursorActionKind::Move, ts_ns));
+                state.increment("move");
+                if args.export_actions {
                     let (wid, zidx) = window_at(pos, wins);
-                    let a = CursorAction {
+                    export(&CursorAction {
                         kind:           CursorActionKind::Move,
                         timestamp_ns:   ts_ns,
                         position:       pos,
@@ -441,8 +400,7 @@ fn process_event(
                         z_index:        zidx,
                         confidence:     1.0,
                         source:         "mouse_events".into(),
-                    };
-                    export(&a);
+                    });
                 }
             }
 
@@ -471,12 +429,15 @@ fn process_event(
                 confidence:     1.0,
                 source:         "mouse_events".into(),
             };
-            if args.export_actions { export(&a); }
-            ds.push(a);
+            emit(&a, args, state);
+            ds.last_activity = Some((CursorActionKind::Scroll, ts_ns));
         }
     }
 }
 
+/// Classify a press→release as `click` or `double_click` and emit it.
+/// Returns the kind so the caller can refresh the per-frame label.
+/// Hold duration and jitter survive in `duration_ms` / `distance_px`, not as labels.
 fn on_click(
     ds:       &mut DetState,
     pos:      (i32, i32),
@@ -487,7 +448,8 @@ fn on_click(
     wid:      Option<u32>,
     zidx:     Option<usize>,
     args:     &CursorActionArgs,
-) {
+    state:    &SharedActionState,
+) -> CursorActionKind {
     let is_double = ds.last_click_ts
         .zip(ds.last_click_pos)
         .map_or(false, |(lt, lp)| {
@@ -498,7 +460,7 @@ fn on_click(
     let (kind, count) = if is_double {
         (CursorActionKind::DoubleClick, 2u8)
     } else {
-        (CursorActionKind::SingleClick, 1u8)
+        (CursorActionKind::Click, 1u8)
     };
 
     let a = CursorAction {
@@ -518,12 +480,20 @@ fn on_click(
         confidence:     0.99,
         source:         "mouse_events".into(),
     };
-    if args.export_actions { export(&a); }
-    ds.push(a);
-    ds.last_click_pos = Some(pos);
-    ds.last_click_ts  = Some(ts_ns);
+    emit(&a, args, state);
+
+    // After a double-click, clear history so a 3rd click starts a fresh single.
+    if is_double {
+        ds.last_click_pos = None;
+        ds.last_click_ts  = None;
+    } else {
+        ds.last_click_pos = Some(pos);
+        ds.last_click_ts  = Some(ts_ns);
+    }
+    kind
 }
 
+/// Emit a single `drag` event carrying the full sampled path + bounding box.
 fn on_drag_end(
     ds:    &mut DetState,
     pos:   (i32, i32),
@@ -533,6 +503,7 @@ fn on_drag_end(
     cw:    u32,
     ch:    u32,
     args:  &CursorActionArgs,
+    state: &SharedActionState,
 ) {
     let down_pos  = ds.mouse_down_pos.unwrap_or(pos);
     let down_ts   = ds.mouse_down_ts.unwrap_or(ts_ns);
@@ -541,50 +512,22 @@ fn on_drag_end(
     let path      = std::mem::take(&mut ds.drag_path);
     let bbox      = ds.bbox_arr(cw, ch);
 
-    let drag_end = CursorAction {
-        kind:           CursorActionKind::DragEnd,
+    let drag = CursorAction {
+        kind:           CursorActionKind::Drag,
         timestamp_ns:   ts_ns,
         position:       pos,
         start_position: Some(down_pos),
         end_position:   Some(pos),
-        path:           path.clone(),
+        path,
         bbox,
         duration_ms:    Some(dur_ms),
         distance_px:    Some(drag_dist),
         button:         Some("left".into()),
         click_count:    None,
-        window_id:      wid,
-        z_index:        zidx,
+        window_id:      wid.or(ds.drag_window_id),
+        z_index:        zidx.or(ds.drag_z_index),
         confidence:     0.95,
         source:         "mouse_events".into(),
     };
-    if args.export_actions { export(&drag_end); }
-    ds.push(drag_end);
-
-    // DragSelect: horizontal-dominant drags may be text selections
-    let (h_ext, v_ext) = match ds.drag_bbox_mm {
-        Some((mn_x, mn_y, mx_x, mx_y)) => ((mx_x - mn_x) as f64, (mx_y - mn_y) as f64),
-        None => (0.0, 0.0),
-    };
-    if h_ext > v_ext && h_ext > 20.0 {
-        let sel = CursorAction {
-            kind:           CursorActionKind::DragSelect,
-            timestamp_ns:   ts_ns,
-            position:       pos,
-            start_position: Some(down_pos),
-            end_position:   Some(pos),
-            path,
-            bbox,
-            duration_ms:    Some(dur_ms),
-            distance_px:    Some(drag_dist),
-            button:         Some("left".into()),
-            click_count:    None,
-            window_id:      wid,
-            z_index:        zidx,
-            confidence:     0.40,   // low: no visual validation yet
-            source:         "mouse_events".into(),
-        };
-        if args.export_actions { export(&sel); }
-        ds.push(sel);
-    }
+    emit(&drag, args, state);
 }

@@ -1,14 +1,14 @@
 use std::ffi::c_void;
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct CGPoint { x: f64, y: f64 }
 
 pub enum TapEvent {
-    KeyDown   { at: Instant },
-    MouseDown { at: Instant, x_pts: f64, y_pts: f64 },
+    KeyDown   { _at: Instant, timestamp_ns: u64, key_code: u16 },
+    MouseDown { _at: Instant, x_pts: f64, y_pts: f64 },
 }
 
 // kCGHIDEventTap = 0, kCGHeadInsertEventTap = 0, kCGEventTapOptionListenOnly = 1
@@ -29,6 +29,7 @@ extern "C" {
         user_info:          *mut c_void,
     ) -> *mut c_void;
     fn CGEventGetLocation(event: *mut c_void) -> CGPoint;
+    fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -57,13 +58,19 @@ unsafe extern "C" fn tap_callback(
 ) -> *mut c_void {
     let ctx = &*(user_info as *const TapCtx);
     let now = Instant::now();
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     match event_type {
         CG_EVENT_KEY_DOWN => {
-            let _ = ctx.tx.send(TapEvent::KeyDown { at: now });
+            // kCGKeyboardEventKeycode = 9
+            let key_code = CGEventGetIntegerValueField(event, 9) as u16;
+            let _ = ctx.tx.send(TapEvent::KeyDown { _at: now, timestamp_ns: ts_ns, key_code });
         }
         CG_EVENT_LEFT_MOUSE_DOWN => {
             let pt = CGEventGetLocation(event);
-            let _ = ctx.tx.send(TapEvent::MouseDown { at: now, x_pts: pt.x, y_pts: pt.y });
+            let _ = ctx.tx.send(TapEvent::MouseDown { _at: now, x_pts: pt.x, y_pts: pt.y });
         }
         _ => {}
     }

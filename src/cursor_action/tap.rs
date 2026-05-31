@@ -1,5 +1,7 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[repr(C)]
@@ -8,11 +10,11 @@ struct CGPoint { x: f64, y: f64 }
 
 #[derive(Debug, Clone)]
 pub enum MouseTapEvent {
-    LeftMouseDown { at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
-    LeftMouseUp   { at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
-    LeftMouseDrag { at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
-    MouseMoved    { at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
-    ScrollWheel   { at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64, delta_y: i64 },
+    LeftMouseDown { _at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
+    LeftMouseUp   { _at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
+    LeftMouseDrag { _at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
+    MouseMoved    { _at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64 },
+    ScrollWheel   { _at: Instant, ts_ns: u64, x_pts: f64, y_pts: f64, delta_y: i64 },
 }
 
 const CG_HID_EVENT_TAP:            u32 = 0;
@@ -75,21 +77,21 @@ unsafe extern "C" fn tap_callback(
 
     let ev = match event_type {
         CG_EVENT_LEFT_MOUSE_DOWN => Some(MouseTapEvent::LeftMouseDown {
-            at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
+            _at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
         }),
         CG_EVENT_LEFT_MOUSE_UP => Some(MouseTapEvent::LeftMouseUp {
-            at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
+            _at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
         }),
         CG_EVENT_MOUSE_MOVED => Some(MouseTapEvent::MouseMoved {
-            at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
+            _at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
         }),
         CG_EVENT_LEFT_MOUSE_DRAGGED => Some(MouseTapEvent::LeftMouseDrag {
-            at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
+            _at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y,
         }),
         CG_EVENT_SCROLL_WHEEL => {
             let delta_y = CGEventGetIntegerValueField(event, CG_SCROLL_DELTA_AXIS1);
             Some(MouseTapEvent::ScrollWheel {
-                at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y, delta_y,
+                _at: now, ts_ns: ts, x_pts: pt.x, y_pts: pt.y, delta_y,
             })
         }
         _ => None,
@@ -101,7 +103,13 @@ unsafe extern "C" fn tap_callback(
     event
 }
 
-pub fn start_mouse_tap(tx: Sender<MouseTapEvent>) {
+/// Start the mouse event tap. Returns a flag the caller can poll to confirm the
+/// tap was actually created — if Input Monitoring permission is denied,
+/// CGEventTapCreate returns NULL and the flag stays false, so the caller can
+/// warn loudly instead of silently recording a session with zero mouse events.
+pub fn start_mouse_tap(tx: Sender<MouseTapEvent>) -> Arc<AtomicBool> {
+    let alive = Arc::new(AtomicBool::new(false));
+    let alive2 = alive.clone();
     std::thread::spawn(move || unsafe {
         let mask = (1u64 << CG_EVENT_LEFT_MOUSE_DOWN)
             | (1u64 << CG_EVENT_LEFT_MOUSE_UP)
@@ -118,10 +126,12 @@ pub fn start_mouse_tap(tx: Sender<MouseTapEvent>) {
             eprintln!("[cursor_action] CGEventTapCreate failed — grant Input Monitoring in System Settings → Privacy & Security → Input Monitoring");
             return;
         }
+        alive2.store(true, Ordering::SeqCst);
         let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
         let rl     = CFRunLoopGetCurrent();
         CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
         CFRelease(source as *const c_void);
         CFRunLoopRun();
     });
+    alive
 }

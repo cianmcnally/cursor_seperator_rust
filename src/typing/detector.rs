@@ -27,9 +27,9 @@ pub struct InteractionRegion {
 pub struct TypingDetectorResult {
     pub region:    Option<InteractionRegion>,
     /// ROI searched (in capture-pixel coords).
-    pub roi:       Option<RectI>,
+    pub _roi:       Option<RectI>,
     /// Grayscale absdiff within ROI, plus its position.
-    pub diff_gray: Option<(Vec<u8>, RectI)>,
+    pub _diff_gray: Option<(Vec<u8>, RectI)>,
 }
 
 pub struct SharedTypingState(Mutex<TypingDetectorResult>);
@@ -57,6 +57,8 @@ pub struct TypingArgs {
     /// Capture origin in pixels (0 for full-display).
     pub cap_origin_x: f64,
     pub cap_origin_y: f64,
+    /// Forward (timestamp_ns, key_code) for every KeyDown to the recorder.
+    pub key_tx: Option<std::sync::mpsc::Sender<(u64, u16)>>,
 }
 
 pub fn start_typing_detector(
@@ -111,7 +113,12 @@ fn run_detector(
         // Drain all pending events (keep latest key, track last click)
         loop {
             match rx.try_recv() {
-                Ok(TapEvent::KeyDown { at }) => pending_key = Some(at),
+                Ok(TapEvent::KeyDown { _at: at, timestamp_ns, key_code }) => {
+                    if let Some(ref tx) = args.key_tx {
+                        let _ = tx.send((timestamp_ns, key_code));
+                    }
+                    pending_key = Some(at);
+                }
                 Ok(TapEvent::MouseDown { x_pts, y_pts, .. }) => {
                     let x_px = x_pts * args.scale - args.cap_origin_x;
                     let y_px = y_pts * args.scale - args.cap_origin_y;
@@ -184,7 +191,7 @@ fn detect(
     let roi_unclamped = choose_roi(ds, bef, fw, fh);
     let roi = match roi_unclamped.clip(fw, fh) {
         Some(r) => r,
-        None => return TypingDetectorResult { region: None, roi: Some(roi_unclamped), diff_gray: None },
+        None => return TypingDetectorResult { region: None, _roi: Some(roi_unclamped), _diff_gray: None },
     };
     let roi_w = roi.w as usize;
     let roi_h = roi.h as usize;
@@ -241,11 +248,11 @@ fn detect(
                     window_id: wid,
                     z_index: zidx,
                 }),
-                roi: Some(roi),
-                diff_gray,
+                _roi: Some(roi),
+                _diff_gray: diff_gray,
             };
         }
-        return TypingDetectorResult { region: None, roi: Some(roi), diff_gray };
+        return TypingDetectorResult { region: None, _roi: Some(roi), _diff_gray: diff_gray };
     }
 
     // Group blobs into text-line bands, pick largest
@@ -283,8 +290,8 @@ fn detect(
             window_id: wid,
             z_index: zidx,
         }),
-        roi: Some(roi),
-        diff_gray,
+        _roi: Some(roi),
+        _diff_gray: diff_gray,
     }
 }
 

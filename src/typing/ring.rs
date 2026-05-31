@@ -7,8 +7,9 @@ use crate::windows::WindowLayer;
 
 pub struct RingEntry {
     pub captured_at:   Instant,
-    pub timestamp_ns:  u64,
-    pub pixels:        Vec<u8>,
+    pub _timestamp_ns:  u64,
+    /// Shared with the capture loop's frame Arc — no extra copy at push time.
+    pub pixels:        Arc<Vec<u8>>,
     pub width:         usize,
     pub height:        usize,
     pub bytes_per_row: usize,

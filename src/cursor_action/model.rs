@@ -1,16 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The seven mutually-exclusive action classes the prediction model consumes.
+/// A held or jittery press is still a `Click`; a select-drag is still a `Drag`.
+/// Sub-signal (hold duration, jitter, click count, drag path) is preserved in the
+/// `CursorAction` fields, not as separate labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CursorActionKind {
+    #[default]
+    Idle,
     Move,
-    SingleClick,
+    Click,
     DoubleClick,
-    ClickAndHold,
-    DragStart,
-    DragMove,
-    DragEnd,
-    DragSelect,
+    Drag,
     Scroll,
+    Typing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

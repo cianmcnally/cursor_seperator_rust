@@ -34,6 +34,11 @@ extern "C" {
 #[link(name = "ScreenCaptureKit", kind = "framework")]
 extern "C" {}
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+}
+
 // dispatch_* lives in libSystem, always linked on macOS
 extern "C" {
     fn dispatch_semaphore_create(value: isize) -> *mut c_void;
@@ -248,10 +253,38 @@ unsafe fn setup_stream(
     let content = catom.load(Ordering::SeqCst) as *mut Object;
     assert!(!content.is_null(), "SCShareableContent nil — grant Screen Recording permission");
 
-    // ── Primary display ───────────────────────────────────────────────────
+    // ── Pick the main display (the one whose dimensions we sized for) ──────
+    // Capture dimensions come from main_display_pixels() == NSScreen.mainScreen.
+    // The SCDisplay we filter on MUST be that same display, else we'd capture a
+    // different monitor at the wrong size. `displays firstObject` is order-
+    // dependent and not guaranteed to be the main display — match by displayID.
     let displays: *mut Object = msg_send![content, displays];
-    let display:  *mut Object = msg_send![displays, firstObject];
+    let dcount:   usize       = msg_send![displays, count];
+    let main_id: u32 = CGMainDisplayID();
+    let mut display: *mut Object = std::ptr::null_mut();
+    for i in 0..dcount {
+        let d: *mut Object = msg_send![displays, objectAtIndex: i];
+        if d.is_null() { continue; }
+        let did: u32 = msg_send![d, displayID];
+        if did == main_id { display = d; break; }
+    }
+    if display.is_null() {
+        display = msg_send![displays, firstObject];
+        eprintln!("[capture] WARNING: main display {main_id} not in SCShareableContent; \
+                   falling back to first display");
+    }
     assert!(!display.is_null(), "no SCDisplay");
+
+    // Multi-display warning: this is a single-display capture. Cursor/mouse
+    // events on other displays land OUTSIDE the captured frame and will not be
+    // pixel-aligned to masks (the ledger flags these as out-of-bounds). Work on
+    // the captured display only, or disconnect the others while recording.
+    if dcount > 1 {
+        let cap_id: u32 = msg_send![display, displayID];
+        eprintln!("[capture] WARNING: {dcount} displays present — capturing only \
+                   display {cap_id} ({output_w}x{output_h}px). Mouse activity on \
+                   other displays will be OUT OF FRAME and unusable for training.");
+    }
 
     // ── Content filter ────────────────────────────────────────────────────
     let filter: *mut Object = {
